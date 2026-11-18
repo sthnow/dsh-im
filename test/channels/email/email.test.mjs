@@ -225,15 +225,32 @@ test('EmailConfigStore persists mailbox settings and reloads them', async () => 
   }
 });
 
-test('EmailStateStore bounds the remembered thread-id map', () => {
-  const state = new EmailStateStore(join(tmpdir(), 'unused-email-state-5.json'));
-  for (let index = 0; index < 2_100; index += 1) {
-    state.rememberThreadId(`<m${index}@mail>`, `email:thread-${index}`);
+test('EmailStateStore bounds the remembered thread-id map', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-email-threads-'));
+  const state = new EmailStateStore(join(dir, 'state.json'));
+  const persist = state.persist.bind(state);
+  const writes = [];
+  state.persist = () => {
+    const write = persist();
+    // rememberThreadId does not return the promise; attach a handler immediately.
+    write.catch(() => {});
+    writes.push(write);
+    return write;
+  };
+  try {
+    for (let index = 0; index < 2_100; index += 1) {
+      state.rememberThreadId(`<m${index}@mail>`, `email:thread-${index}`);
+    }
+    // The newest ids survive; the oldest are evicted.
+    assert.equal(state.conversationForThreadId('<m2099@mail>'), 'email:thread-2099');
+    assert.equal(state.conversationForThreadId('<m0@mail>'), null);
+    assert.equal(state.threadMap.size, 2_000);
+  } finally {
+    const results = await Promise.allSettled(writes);
+    await rm(dir, { recursive: true, force: true });
+    const failure = results.find((result) => result.status === 'rejected');
+    if (failure) throw failure.reason;
   }
-  // The newest ids survive; the oldest are evicted.
-  assert.equal(state.conversationForThreadId('<m2099@mail>'), 'email:thread-2099');
-  assert.equal(state.conversationForThreadId('<m0@mail>'), null);
-  assert.equal(state.threadMap.size, 2_000);
 });
 
 test('EmailController reads the mailbox secret from the credential wrapper', async () => {

@@ -49,6 +49,26 @@ test('StateStore resumes writes after a rename failure and persists queued chang
   ]);
 });
 
+test('flush persists current state after a failed mirror deletion and later rebind', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-feishu-flush-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  const backup = join(dir, 'backup.json');
+  const store = await new StateStore(path).load();
+  await store.setMirror('key', { sessionId: 'old' });
+  await rename(path, backup);
+  await mkdir(path);
+  await assert.rejects(store.clearMirror('key'));
+  assert.equal(store.mirrorEntries().length, 0);
+  await rm(path, { recursive: true });
+  await rename(backup, path);
+  await store.flush();
+  assert.deepEqual((await new StateStore(path).load()).mirrorEntries(), []);
+  await store.setMirror('key', { sessionId: 'new' });
+  await store.flush();
+  assert.equal((await new StateStore(path).load()).mirrorEntries()[0][1].sessionId, 'new');
+});
+
 test('StateStore persists managed-topic roots (thread_id → root message)', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-feishu-state-topics-'));
   const path = join(dir, 'state.json');

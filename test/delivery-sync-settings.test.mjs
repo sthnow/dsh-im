@@ -111,7 +111,8 @@ test('the store writes the document atomically and reads it back', async (t) => 
       modelIcon: '',
     },
   });
-  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  // Windows does not implement POSIX permission bits; ACLs govern access there.
+  if (process.platform !== 'win32') assert.equal((await stat(path)).mode & 0o777, 0o600);
 
   // A later save keeps the fields it did not touch.
   await store.set({ modelIcon: '🤖' });

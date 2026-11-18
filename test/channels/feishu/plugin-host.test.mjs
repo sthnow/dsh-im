@@ -1373,6 +1373,8 @@ test('production assembly uses ctx credentials and the modern Host gateway witho
       constructed.verifyOptions = options;
       return {};
     },
+    profileEnv: { DSH_PROFILE: 'host-test-profile' },
+    electron: '',
     proxyEnv: { HTTPS_PROXY: 'http://proxy.test:8080' },
     createProxyAgent: (proxyUrl) => {
       constructed.wsAgentCreated = (constructed.wsAgentCreated ?? 0) + 1;
@@ -1416,12 +1418,17 @@ test('production assembly uses ctx credentials and the modern Host gateway witho
       secretRef: 'DSH_FEISHU_APP_SECRET_ALPHA',
       domain: 'feishu',
       ownerOpenIds: ['ou_alpha'],
+      hfcPresentation: { backend: 'hfc', testSessionIds: ['trial-session'], python: 'python' },
     },
     appSecret: 'alpha-secret',
     repair,
   });
   const alphaState = constructed.runtime.state;
   assert.equal(constructed.runtime.botId, 'bot_alpha');
+  assert.deepEqual(constructed.runtime.hfcPresentation, { backend: 'hfc', testSessionIds: ['trial-session'], python: 'python' });
+  assert.match(constructed.runtime.hfcRuntimeNamespace, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  assert.equal(Object.hasOwn(constructed.runtime, 'profileId'), false);
+  assert.equal(Object.hasOwn(constructed.runtime, 'profileIdentity'), false);
   assert.equal(constructed.runtime.repair, repair);
   assert.equal(Object.hasOwn(constructed.runtime, 'outboundArtifactsEnabled'), false);
   await constructed.controller.createRuntime({

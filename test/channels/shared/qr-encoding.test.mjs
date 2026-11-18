@@ -3,7 +3,6 @@ import { createRequire } from 'node:module';
 import test from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { PNG } from 'pngjs';
 import { createWeixinRpcHandler } from '../../../plugin-src/host/channels/weixin/rpc.mjs';
 import { createFeishuRpcHandler } from '../../../plugin-src/host/channels/feishu/rpc.mjs';
 import { createDingtalkRpcHandler } from '../../../plugin-src/host/channels/dingtalk/rpc.mjs';
@@ -25,6 +24,7 @@ const fakePng = 'data:image/png;base64,YWJjZA==';
 const privateText = 'private-token https://user:password@private.example/?secret=secret';
 const require = createRequire(import.meta.url);
 const qrcodeRequire = createRequire(require.resolve('qrcode/package.json'));
+const { PNG } = qrcodeRequire('pngjs');
 const expectedDependencies = normalizeDiagnosticDetails({ dependencies: {
   qrcode: require('qrcode/package.json').version,
   pngjs: qrcodeRequire('pngjs/package.json').version,

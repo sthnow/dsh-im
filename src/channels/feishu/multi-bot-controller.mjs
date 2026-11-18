@@ -143,6 +143,8 @@ export class MultiBotDshFeishuController {
   #configStore;
   #createRuntime;
   #deleteState;
+  #validateStateDeletion;
+  #beginStateDeletion;
   #createBotId;
   #createRegistrationId;
   #runtimes = new Map();
@@ -166,6 +168,8 @@ export class MultiBotDshFeishuController {
     configStore,
     createRuntime,
     deleteState = async () => {},
+    validateStateDeletion = async () => {},
+    beginStateDeletion = async () => {},
     createBotId = makeBotId,
     createRegistrationId = makeRegistrationId,
     callbackProbeTimeoutMs = DEFAULT_CALLBACK_PROBE_TIMEOUT_MS,
@@ -178,6 +182,8 @@ export class MultiBotDshFeishuController {
     }
     if (typeof createRuntime !== 'function') throw new Error('createRuntime is required');
     if (typeof deleteState !== 'function') throw new Error('deleteState must be a function');
+    if (typeof validateStateDeletion !== 'function') throw new TypeError('validateStateDeletion must be a function');
+    if (typeof beginStateDeletion !== 'function') throw new TypeError('beginStateDeletion must be a function');
     if (!Number.isFinite(callbackProbeTimeoutMs)
       || callbackProbeTimeoutMs <= 0
       || callbackProbeTimeoutMs > MAX_CALLBACK_PROBE_TIMEOUT_MS) {
@@ -190,6 +196,8 @@ export class MultiBotDshFeishuController {
     this.#configStore = configStore;
     this.#createRuntime = createRuntime;
     this.#deleteState = deleteState;
+    this.#validateStateDeletion = validateStateDeletion;
+    this.#beginStateDeletion = beginStateDeletion;
     this.#createBotId = createBotId;
     this.#createRegistrationId = createRegistrationId;
     this.#callbackProbeTimeoutMs = callbackProbeTimeoutMs;
@@ -1569,10 +1577,15 @@ export class MultiBotDshFeishuController {
   async #deleteBot(botId) {
     let config = this.#configStore.getBot(botId);
     if (!config) return;
-    this.#inboundConsumers.remove(botId);
+    // Every public/internal caller holds config then bot transition here.
+    // Preflight is read-only; failed persistence must leave state and inbound
+    // ownership usable. Later failures deliberately retain pending + the fence.
+    await this.#validateStateDeletion({ botId, config });
     if (!config.deletionPending) {
       config = await this.#configStore.saveBot({ ...config, deletionPending: true });
     }
+    await this.#beginStateDeletion({ botId, config });
+    this.#inboundConsumers.remove(botId);
     await this.#stopRuntime(botId);
     try {
       await atConnectionStage('credential.remove', () => this.#credentials.unset(config.secretRef), 'credential-store');

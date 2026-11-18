@@ -9670,6 +9670,44 @@ test('restart compensation keeps entries waiting when the turn has not finished'
   await bridge.waitForIdle();
 });
 
+test('idle waits for reconnect deferred producer before it enqueues work', async () => {
+  const { state } = await watchStoreFixture([['p2p:ou_owner', 'session-timeout']]);
+  const harness = watchHarness({ history: deferredAnswerHistory });
+  const sent = [];
+  const bridge = new FeishuHarnessBridge({
+    client: textClient(async ({ text }) => sent.push(text)), channel: {}, harness, state,
+    status: bridgeStatus(), allowedSenderOpenIds: new Set(['ou_owner']),
+  });
+  await bridge.waitForIdle();
+  await state.putDeferred(deferredEntryFixture());
+  const originalEntries = state.deferredEntries.bind(state);
+  const entered = deferred();
+  const release = deferred();
+  let first = true;
+  state.deferredEntries = async () => {
+    if (first) {
+      first = false;
+      entered.resolve();
+      await release.promise;
+    }
+    return originalEntries();
+  };
+
+  harness._listeners.at(-1).onReconnect();
+  await entered.promise;
+  let idle = false;
+  const waiting = bridge.waitForIdle().then(() => { idle = true; });
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(idle, false, 'idle must include the producer before its first enqueue');
+  } finally {
+    release.resolve();
+    await waiting;
+  }
+  assert.equal(sent.filter((text) => text.includes('计算结果：42')).length, 1);
+  assert.equal(originalEntries().length, 0);
+});
+
 test('mux reconnect re-runs deferred compensation', async () => {
   const { state } = await watchStoreFixture([['p2p:ou_owner', 'session-timeout']]);
   const harness = watchHarness({ history: [] });
@@ -11186,6 +11224,17 @@ test('step push on: question and approval present independently and coexist with
 test('step push on: /watch pushes and artifact delivery are unaffected', async (t) => {
   const artifact = await committedArtifact(t, 'coexist-result.txt', 'coexist result', 'coexist');
   const { state } = await watchStoreFixture([['p2p:ou_owner', 'session-step-watch']]);
+  const watchPersistenceErrors = [];
+  const setWatch = state.setWatch.bind(state);
+  state.setWatch = async (...args) => {
+    try {
+      return await setWatch(...args);
+    } catch (error) {
+      watchPersistenceErrors.push(error);
+      console.error('[watch-regression] setWatch failed:', error);
+      throw error;
+    }
+  };
   const harness = watchHarness({
     sessionsByWorkspace: {
       'C:/work': [{ sessionId: 'watched-session', title: 'Watched', lastSeq: -1 }],

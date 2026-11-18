@@ -1,3 +1,4 @@
+import { normalizeHfcRuntimeNamespace, hfcRuntimeNamespaceFacts } from './hfc/runtime-namespace.mjs';
 import { createConnectionDiagnostics, atConnectionStage } from '../shared/connection-error.mjs';
 import { readExternalHistory } from './history-reader.mjs';
 import { randomUUID } from 'node:crypto';
@@ -12,6 +13,8 @@ import {
   SLASH_COMMAND_MANIFEST,
 } from './slash-command-registry.mjs';
 import { normalizeSlashPanelConfig } from './slash-command-panel.mjs';
+import { normalizeHfcPresentation } from './hfc-presentation-config.mjs';
+import { recordHfcDiagnostic } from './hfc-diagnostics.mjs';
 import {
   connectionTestTargetUnavailable,
   sendRememberedConnectionTest,
@@ -120,6 +123,9 @@ export class FeishuRuntime {
   #stepPush;
   #stepPushMode;
   #stepCardPanels;
+  #hfcPresentation;
+  #hfcRuntimeNamespace;
+  #hfcDiagnostic;
   #voice = null;
   #sessionSyncTargetsFor;
   #ownerOpenIds;
@@ -174,6 +180,9 @@ export class FeishuRuntime {
     stepPush = false,
     stepPushMode = 'post',
     stepCardPanels,
+    hfcPresentation,
+    hfcRuntimeNamespace,
+    hfcDiagnostic,
     voice = null,
     sessionSyncTargetsFor = null,
     ownerOpenId,
@@ -219,6 +228,9 @@ export class FeishuRuntime {
     this.#stepPush = stepPush === true;
     this.#stepPushMode = normalizeFeishuStepPushMode(stepPushMode);
     this.#stepCardPanels = normalizeFeishuStepCardPanels(stepCardPanels);
+    this.#hfcPresentation = normalizeHfcPresentation(hfcPresentation);
+    this.#hfcRuntimeNamespace = normalizeHfcRuntimeNamespace(hfcRuntimeNamespace);
+    this.#hfcDiagnostic = typeof hfcDiagnostic === 'function' ? hfcDiagnostic : null;
     // voice 为 { config, secret } 来源;凭据缺失时 createVoice 返回禁用对象,
     // 桥接层完全跳过语音路径,不影响连接。
     this.#voice = voice == null
@@ -343,6 +355,11 @@ export class FeishuRuntime {
     this.#status.lastError = null; this.#status.error = null; this.#diagnostics.clear();
 
     try {
+      if (this.#hfcPresentation.backend === 'hfc') {
+        await recordHfcDiagnostic({ stage: 'runtime.start', error: { code: 'hfc-runtime-start' },
+          identity: hfcRuntimeNamespaceFacts(this.#hfcRuntimeNamespace), logger: this.#logger, record: this.#hfcDiagnostic });
+        assertCurrentStart();
+      }
       await atConnectionStage('harness.check', () => this.#harness.ensureRunning({ signal }));
       assertCurrentStart();
       this.#status.harnessReachable = true;
@@ -385,6 +402,9 @@ export class FeishuRuntime {
         stepPush: this.#stepPush,
         stepPushMode: this.#stepPushMode,
         stepCardPanels: this.#stepCardPanels,
+        hfcPresentation: this.#hfcPresentation,
+        hfcRuntimeNamespace: this.#hfcRuntimeNamespace,
+        hfcDiagnostic: this.#hfcDiagnostic,
         voice: this.#voice,
         sessionSyncTargetsFor: this.#sessionSyncTargetsFor,
         repair: this.#repair,

@@ -2,6 +2,7 @@ export const FEISHU_STEP_PUSH_MODES = Object.freeze({
   POST: 'post',
   STREAMING_CARD: 'streaming_card',
   LIVE_COT: 'live_cot',
+  HERMES_CARD: 'hermes_card',
 });
 
 /** New connections explicitly opt into the process-card presentation. */
@@ -36,11 +37,15 @@ export function normalizeFeishuStepPushMode(value) {
   if (value === FEISHU_STEP_PUSH_MODES.LIVE_COT) {
     return FEISHU_STEP_PUSH_MODES.LIVE_COT;
   }
+  if (value === FEISHU_STEP_PUSH_MODES.HERMES_CARD) {
+    return FEISHU_STEP_PUSH_MODES.HERMES_CARD;
+  }
   return FEISHU_STEP_PUSH_MODES.POST;
 }
 
 export function isFeishuStepPushMode(value) {
   return value === FEISHU_STEP_PUSH_MODES.POST
     || value === FEISHU_STEP_PUSH_MODES.STREAMING_CARD
-    || value === FEISHU_STEP_PUSH_MODES.LIVE_COT;
+    || value === FEISHU_STEP_PUSH_MODES.LIVE_COT
+    || value === FEISHU_STEP_PUSH_MODES.HERMES_CARD;
 }

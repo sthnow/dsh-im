@@ -601,7 +601,7 @@ test('Feishu keeps its heading controls on one row without a plus icon', async (
   assert.doesNotMatch(styles, /\.bxf-headingTools \.bxf-button \{ margin-left: auto; \}/);
 });
 
-test('Feishu bot settings render one step-push select with four presentations', async (t) => {
+test('Feishu bot settings render one step-push select with five presentations', async (t) => {
   const previousWindow = globalThis.window;
   let nextTimer = 0;
   const frames = new Map();
@@ -667,7 +667,7 @@ test('Feishu bot settings render one step-push select with four presentations', 
     await flushTasks();
   });
 
-  // Rendering: one select with the three presentations, defaulting to off.
+  // Rendering: one select with the five presentations, defaulting to off.
   const stepPushSelect = () => renderer.root.findByProps({ 'aria-label': '任务过程展示' });
   assert.equal(stepPushSelect().type, 'select');
   assert.equal(stepPushSelect().props.value, 'off');
@@ -675,7 +675,7 @@ test('Feishu bot settings render one step-push select with four presentations', 
     .some((heading) => nodeText(heading) === '任务过程展示'));
   assert.deepEqual(
     stepPushSelect().findAllByType('option').map((option) => option.props.value),
-    ['off', 'live_cot', 'streaming_card', 'post'],
+    ['off', 'live_cot', 'streaming_card', 'hermes_card', 'post'],
   );
   const helpNodes = renderer.root.findAll(
     (node) => node.props?.className === 'dim-feishuGroupHelp',

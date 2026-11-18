@@ -1,0 +1,31 @@
+{
+  "upstream": "hermes-feishu-streaming-card",
+  "version": "5.0.25",
+  "scope": "Unmodified transitive relative-import closure of render/session/events; no config loader, server or execution registry.",
+  "sha256": {
+    "hermes_feishu_card/__init__.py": "3d09cfe7b44fe0edb4a110b72cf4d40eb1ada25e9a8807eceb26f359033071ae",
+    "hermes_feishu_card/approval_receipts.py": "98cf773d9ca315a2f54d426d6b343b09497287ce6df76463b764051a34ef992d",
+    "hermes_feishu_card/approval_rule_hints.py": "6c8a9565009c4cadf593f46c08adb626775a17b3fa3d1a5be2a83386ad16b6bc",
+    "hermes_feishu_card/card_limits.py": "9ec6da342c565527787897d44c09baa7f435ac3a01f63490840f835115f0ef36",
+    "hermes_feishu_card/card_segmentation.py": "e562c861515f344531e205e8bb2a043ac4e2e5d006d679f25a21a4ccff872166",
+    "hermes_feishu_card/card_timeline.py": "8eeed8e0be2a1ff088f3b126b418894cc44ee9dd4ccb7ea051aa95c888a20308",
+    "hermes_feishu_card/card_view.py": "e56c7e00220f50ee9a32ec2c9b48653e9ed71cfd58945c325a753f62e8914b35",
+    "hermes_feishu_card/config_rules.py": "4e8560b88cbcc6dba2225633c29d1d1413063e53496ef966cfb5582f2aaf6bdf",
+    "hermes_feishu_card/content_plan.py": "6cc3167fe5e8a149e8be3379a7460cc532a0735d43c45886a71bb925469d33a6",
+    "hermes_feishu_card/display_redaction.py": "f43172432990c1140fe91e2f73a062297c2bfcb3e3004f57b4e3dedccb390518",
+    "hermes_feishu_card/display_segments.py": "7c3c07bfa8c10eb8a92351554640fec8b283a3d21f95c1109f786787c59d884b",
+    "hermes_feishu_card/events.py": "a8abad11edfe2b50abd0037b5d725cf847b98c23423bf595639ea5a0c8598384",
+    "hermes_feishu_card/native_handoff.py": "dac6cbd50a736affc68ae91fe29a540d38eb0561283dc03cebd28977a1ff20ae",
+    "hermes_feishu_card/native_tables.py": "07eb25d80cc838e91452e569dfe0619ab0edd365e958fa8a8d4eafa8ad286462",
+    "hermes_feishu_card/observations.py": "062f52de50ccbf2719e886d917d87acb025d189c9f1dbe2e4ab6b6f22465937c",
+    "hermes_feishu_card/presentation.py": "4070e8423719dea5a3206340c6c554ecd64353b6f75d4ee016e1f3f3a62ed71d",
+    "hermes_feishu_card/process_activity.py": "8592eec017e60665aa1478446df1dbece51958857b413e699e07a17dab59e0f5",
+    "hermes_feishu_card/render.py": "a25833fa5a90b617625e5ee4f3a51ae3edeea8af7fe20a41eae7088f068c839b",
+    "hermes_feishu_card/session.py": "ed0e24ae6fc4106f5bf94981c5ff72717e7c49777c94fc91f59eb7fdf1712cc0",
+    "hermes_feishu_card/status.py": "bcfa8d5235968b06a930ed193595bc37a5c9575d78a702d210c99177c44f0660",
+    "hermes_feishu_card/subscription_usage.py": "61cce356fbaaf010972560e19865a66373dcc8f6fd04d7e0b81b37edab22c9d7",
+    "hermes_feishu_card/text.py": "8cb4a2f244464a1171ce0edf8425a1adc8b2960f98edf431d8b9e34552a76084",
+    "hermes_feishu_card/turn_metrics.py": "af58fc29375ba078f72784c0ac8c8d5cf9d3953c18593619a4be35d2ddcebd1f",
+    "LICENSE": "9146ca9a7cadf5eaf97d7bec8b9f520e5fd6e0665d3fe50b2b1616d8e4746bb1"
+  }
+}

@@ -109,7 +109,7 @@ export function BotGeneralSettingsPage({ channel, account, rpcCall }) {
             }),
           })))) : null),
     channel === 'feishu' ? h('p', { className: 'dim-botGeneralHelp dim-botGeneralPanelHelp', id: `${modeId}-panels-description` },
-      '仅对实时过程卡生效，任务结束后自动收起。') : null,
+      '实时过程卡分别控制思考与工具面板，任务结束后自动收起；Hermes 风格卡片共用一个过程面板，任一开关开启即展开，任务结束后保持该设置。') : null,
     feedback ? h('p', {
       className: 'dim-accessFeedback', 'data-tone': 'error', role: 'alert',
     }, feedback) : null,

@@ -1,4 +1,5 @@
 import { groupHistoryAccess } from './group-history-access.mjs';
+import { observedRate, observedStreamWindow, terminalContext } from './hfc-display-metrics.mjs';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
@@ -437,6 +438,10 @@ export class AssistantTextAccumulator {
     this.#legacyText = '';
   }
 
+  clearStep(step) {
+    this.#steps.delete(Number.isSafeInteger(step) ? step : 0);
+  }
+
   appendDelta(step, index, text) {
     if (typeof text !== 'string' || !text) return;
     const stepNumber = Number.isSafeInteger(step) ? step : 0;
@@ -617,8 +622,29 @@ export class HarnessReplyTracker {
   #pendingReasoning = new Map();
   #pendingReasoningChars = 0;
   #reasoning = false;
+  #hermesCard = false;
+  #hermesText = new Map();
+  // Retain indexed text for the active attempt: unlike an eviction-based
+  // dedupe cache this can recover missing, out-of-order frames on replay.
+  #hermesIndexed = new Map();
+  #hermesAttemptEpochs = new Map();
+  #hermesEmittedText = new Map();
+  #hermesReasoningSteps = new Set();
+  #hermesMetricsMessages = new Map();
+  #hermesObservedSteps = new Set();
+  #hermesMetricsUnattributed = false;
+  #hermesRateInvalid = false;
+  #hermesEndSeq = null;
+  #hermesContext = null;
+  #hermesTerminalDisplayApplied = false;
+  #hermesLastMetrics = null;
+  #hermesPending = [];
+  #hermesPendingChars = 0;
+  #hermesAttempts = new Map();
+  #hermesRetiredAttempts = new Set();
+  #hermesCommittedSteps = new Set();
 
-  constructor({ promptRpcId, afterSeq = -1, reasoning = false, finalAnswerOnly = false }) {
+  constructor({ promptRpcId, afterSeq = -1, reasoning = false, finalAnswerOnly = false, hermesCard = false }) {
     this.#promptRpcId = promptRpcId;
     this.#promptFailure = new PromptFailureTracker(promptRpcId, afterSeq);
     this.#lastSeq = afterSeq;
@@ -626,6 +652,7 @@ export class HarnessReplyTracker {
     // thinking traces (Telegram thinking mode) subscribe; every other channel
     // keeps its pre-thinking-traces update stream untouched.
     this.#reasoning = reasoning === true;
+    this.#hermesCard = hermesCard === true;
     if (finalAnswerOnly === true) this.#finalAssistantText = new AssistantTextAccumulator();
   }
 
@@ -658,10 +685,75 @@ export class HarnessReplyTracker {
     return this.#targetTurn;
   }
 
-  #commitText(text, pushUpdate) {
+  #commitText(text, pushUpdate, step = null, event = null) {
+    if (this.#hermesCard) {
+      // Keep answer aggregation unchanged, but card drafts replace only their
+      // own step. Identical text in two different steps is not a duplicate.
+      this.#latestText = text;
+      let accumulator = this.#hermesText.get(step);
+      if (!accumulator) {
+        accumulator = new AssistantTextAccumulator();
+        this.#hermesText.set(step, accumulator);
+      }
+      if (event?.type === 'assistant/chunk') {
+        accumulator.appendDelta(step, event.data.chunk.index, event.data.chunk.text);
+      } else {
+        accumulator.setCanonical(step, assistantMessageText(event));
+      }
+      const stepText = accumulator.text;
+      if (!stepText || this.#hermesEmittedText.get(step) === stepText) return;
+      this.#hermesEmittedText.set(step, stepText);
+      pushUpdate({ type: 'text', step, text: stepText });
+      return;
+    }
     if (!text || text === this.#latestText) return;
     this.#latestText = text;
     pushUpdate({ type: 'text', text });
+  }
+
+  #emitHermesMetrics(event, step, pushUpdate) {
+    if (!this.#hermesCard) return;
+    // Only the durable, same-step model message owns usage. In particular,
+    // request/header, session projections and stream usage are not round totals.
+    if (event) {
+      if (step === null) this.#hermesMetricsUnattributed = true;
+      if (Number.isSafeInteger(event.seq)) {
+        this.#hermesMetricsMessages.set(event.seq, {
+          step, usage: event.data.usage, message: { source: event.data.message?.source },
+          // Parse once per durable message; retain no stream text/arguments.
+          window: observedStreamWindow(event.data.stream), interrupted: event.data.interrupted,
+        });
+      }
+    }
+    const messages = [...this.#hermesMetricsMessages.values()];
+    const trusted = !this.#hermesMetricsUnattributed && messages.length > 0
+      && [...this.#hermesObservedSteps].every((observed) => messages.some((data) => data.step === observed))
+      && messages.every((data) => data.message?.source?.kind === 'model');
+    const metrics = { type: 'metrics' };
+    if (trusted) {
+      for (const key of ['inputTokens', 'outputTokens']) {
+        // A missing step must hide the total rather than silently become zero.
+        if (!messages.every((data) => Number.isSafeInteger(data.usage?.[key]) && data.usage[key] >= 0)) continue;
+        const total = messages.reduce((sum, data) => sum + data.usage[key], 0);
+        if (Number.isSafeInteger(total)) metrics[key] = total;
+      }
+      const sources = messages.map((data) => data.message.source);
+      // Mixed routes have no single truthful model/provider label.
+      if (sources.every((source) => nonEmptyText(source.model) && nonEmptyText(source.provider)
+        && source.model === sources[0].model && source.provider === sources[0].provider)) {
+        metrics.model = sources[0].model;
+        metrics.provider = sources[0].provider;
+      }
+    }
+    const rate = observedRate(messages, this.#hermesObservedSteps, {
+      invalid: this.#hermesMetricsUnattributed || this.#hermesRateInvalid,
+      ...(this.#finished ? { reason: this.#reason } : {}),
+    });
+    if (rate) metrics.rate = rate;
+    if (this.#hermesContext) metrics.context = this.#hermesContext;
+    // Complete replacements, including empty snapshots, retract partial fields.
+    this.#hermesLastMetrics = JSON.stringify(metrics);
+    pushUpdate(metrics);
   }
 
   #bufferReasoning(event) {
@@ -692,14 +784,14 @@ export class HarnessReplyTracker {
     pushUpdate({ type: 'reasoning', turn: this.#targetTurn, text });
   }
 
-  consumeAll(entries, { live = false, fromMux = false } = {}) {
+  consumeAll(entries, { live = false, fromMux = false, terminalDisplay } = {}) {
     const updates = [];
     // 同一批轮询内的 text 帧只保留最新累积，其余事件逐帧透出，
     // 让消费方能按顺序看到每个工具调用与结果。
     const pushUpdate = (update) => {
       if (update.type === 'text' && updates.length > 0) {
         const last = updates[updates.length - 1];
-        if (last.type === 'text') {
+        if (last.type === 'text' && (!this.#hermesCard || last.step === update.step)) {
           updates[updates.length - 1] = update;
           return;
         }
@@ -716,12 +808,112 @@ export class HarnessReplyTracker {
       const seq = event.seq ?? -1;
       const isReasoning = event.type === 'assistant/chunk'
         && event.data?.chunk?.type === 'reasoning-delta';
+      const isTextChunk = event.type === 'assistant/chunk'
+        && event.data?.chunk?.type === 'text-delta';
       // The mux is lossy across reconnects. Only history may advance the
       // durable cursor or finish the reply; the mux supplements reasoning.
-      if (fromMux && !isReasoning) continue;
+      // Hermes also accepts live text chunks because its card shows a
+      // display-only draft that the durable message replaces at step end.
+      const isStreamControl = event.type === 'assistant/stream-start' || event.type === 'assistant/stream-end';
+      if (fromMux && !isReasoning && !(this.#hermesCard && (isTextChunk || isStreamControl))) continue;
+      const transientText = this.#hermesCard && isTextChunk
+        && (fromMux || !Number.isSafeInteger(seq) || event.data?.attemptId !== undefined);
+      if (this.#hermesCard && (transientText || isStreamControl) && this.#targetTurn === null) {
+        const size = event.data?.chunk?.text?.length ?? 0;
+        if (size <= 65536) {
+          this.#hermesPending.push(event);
+          this.#hermesPendingChars += size;
+          while (this.#hermesPending.length > 256 || this.#hermesPendingChars > 65536) {
+            const removed = this.#hermesPending.shift();
+            this.#hermesPendingChars -= removed.data?.chunk?.text?.length ?? 0;
+          }
+        }
+        continue;
+      }
+      if (this.#hermesCard && (transientText || isStreamControl)) {
+        if (event.data?.turn !== this.#targetTurn) continue;
+        const step = event.data?.step ?? 0;
+        if (Number.isSafeInteger(event.data?.step) && event.data.step >= 0) this.#hermesObservedSteps.add(event.data.step);
+        else this.#hermesRateInvalid = true;
+        const attempt = event.data?.attemptId;
+        if (this.#hermesCommittedSteps.has(step)) continue;
+        if (attempt !== undefined && attempt !== null) {
+          const current = this.#hermesAttempts.get(step);
+          const epoch = event.data?.attemptEpoch;
+          const knownEpoch = this.#hermesAttemptEpochs.get(step);
+          if (Number.isSafeInteger(knownEpoch)) {
+            if (!Number.isSafeInteger(epoch) || epoch < knownEpoch || (epoch === knownEpoch && current !== undefined && current !== attempt)) continue;
+          }
+          if (this.#hermesRetiredAttempts.has(attempt)) continue;
+          if (Number.isSafeInteger(epoch)) this.#hermesAttemptEpochs.set(step, epoch);
+          if (current !== attempt) {
+            if (current !== undefined) {
+              this.#hermesRetiredAttempts.add(current);
+              if (this.#hermesRetiredAttempts.size > 256) this.#hermesRetiredAttempts.delete(this.#hermesRetiredAttempts.values().next().value);
+              this.#assistantText.clearStep(step);
+              this.#hermesText.delete(step);
+              this.#hermesIndexed.delete(step);
+              this.#hermesEmittedText.delete(step);
+              pushUpdate({ type: 'text', step, text: '' });
+            }
+            this.#hermesAttempts.set(step, attempt);
+          }
+          if (event.type === 'assistant/stream-end') {
+            if (event.data?.outcome?.kind !== 'committed' && event.data?.outcome !== 'success' && event.data?.outcome !== 'completed') {
+              this.#hermesRetiredAttempts.add(attempt);
+              this.#hermesAttempts.delete(step);
+              this.#assistantText.clearStep(step);
+              this.#hermesText.delete(step);
+              this.#hermesIndexed.delete(step);
+              this.#hermesEmittedText.delete(step);
+              this.#latestText = this.#assistantText.text;
+              pushUpdate({ type: 'text', step, text: '' });
+            }
+            continue;
+          }
+          if (isStreamControl) continue;
+        } else if (isStreamControl) continue;
+        const streamIndex = event.data?.streamIndex;
+        if (attempt != null && Number.isSafeInteger(streamIndex) && streamIndex >= 0) {
+          let state = this.#hermesIndexed.get(step);
+          if (!state) {
+            state = { chunks: new Map(), highest: -1 };
+            this.#hermesIndexed.set(step, state);
+          }
+          if (state.chunks.has(streamIndex)) continue;
+          state.chunks.set(streamIndex, event);
+          if (streamIndex < state.highest) {
+            // A missing frame arrived late. Rebuild in stream order, rather
+            // than appending it to the wrong end of the visible draft.
+            this.#assistantText.clearStep(step);
+            this.#hermesText.delete(step);
+            this.#hermesEmittedText.delete(step);
+            for (const [, chunk] of [...state.chunks].sort(([a], [b]) => a - b)) {
+              this.#assistantText.appendDelta(step, chunk.data.chunk.index ?? 0, chunk.data.chunk.text);
+              this.#commitText(this.#assistantText.text, () => {}, step, chunk);
+            }
+            const text = this.#hermesText.get(step)?.text ?? '';
+            pushUpdate({ type: 'text', step, text });
+          } else {
+            state.highest = streamIndex;
+            this.#assistantText.appendDelta(step, event.data.chunk.index ?? 0, event.data.chunk.text);
+            this.#commitText(this.#assistantText.text, pushUpdate, step, event);
+          }
+          continue;
+        }
+        const key = attempt == null ? `legacy:${seq}` : `${attempt}:${seq}`;
+        if (this.#transientSeqs.has(key)) continue;
+        this.#transientSeqs.add(key);
+        if (this.#transientSeqs.size > 4096) this.#transientSeqs.delete(this.#transientSeqs.values().next().value);
+        this.#assistantText.appendDelta(step, event.data.chunk.index ?? 0, event.data.chunk.text);
+        this.#commitText(this.#assistantText.text, pushUpdate, step, event);
+        continue;
+      }
       const failedTurn = fromMux ? null : this.#promptFailure.consume(event);
       if (isReasoning) {
-        if (!live || !Number.isFinite(seq)) continue;
+        // Hermes consumes one canonical reasoning message per step, including
+        // history replay; mixing that with live deltas would repeat the trace.
+        if (this.#hermesCard || !live || !Number.isFinite(seq)) continue;
         if (this.#targetTurn === null) this.#bufferReasoning(event);
         else this.#emitReasoning(event, pushUpdate);
         continue;
@@ -735,12 +927,17 @@ export class HarnessReplyTracker {
         if (event.type === 'user/message' && event.data?.source?.rpcId === this.#promptRpcId) {
           this.#lastSeq = seq;
           this.#targetTurn = event.data?.turn ?? this.#openTurn;
-          if (live && this.#targetTurn !== null) {
+          if ((live || this.#hermesCard) && this.#targetTurn !== null) {
             pushUpdate({ type: 'turn-start', turn: this.#targetTurn });
             // Only earlier fragments flush here. Later steps remain in the
             // sorted batch, interleaved with their tool calls and results.
             for (const pending of this.#takePendingReasoning()) {
               this.#emitReasoning(pending, pushUpdate);
+            }
+            const pendingHermes = this.#hermesPending.splice(0);
+            this.#hermesPendingChars = 0;
+            for (const pending of pendingHermes) {
+              for (const update of this.consumeAll([pending], { live, fromMux: true })) pushUpdate(update);
             }
           }
           continue;
@@ -750,6 +947,19 @@ export class HarnessReplyTracker {
         if (event.type !== 'turn/end' || failedTurn === null || failedTurn !== event.data?.turn) continue;
         this.#targetTurn = failedTurn;
       }
+      if (this.#hermesCard && isTextChunk
+        && (!Number.isInteger(seq) || seq <= this.#lastSeq)) {
+        // DSH publishes live chunks with a fractional seq just below the
+        // durable cursor. They feed the live draft only; the durable
+        // assistant/message replaces it when the step commits, so the cursor
+        // must never advance from a transient frame.
+        if (event.data?.turn !== this.#targetTurn || this.#transientSeqs.has(seq)) continue;
+        this.#transientSeqs.add(seq);
+        const liveStep = event.data?.step ?? 0;
+        this.#assistantText.appendDelta(liveStep, event.data.chunk.index ?? 0, event.data.chunk.text);
+        this.#commitText(this.#assistantText.text, pushUpdate, liveStep, event);
+        continue;
+      }
       if (seq <= this.#lastSeq) continue;
       this.#lastSeq = seq;
 
@@ -757,7 +967,7 @@ export class HarnessReplyTracker {
 
       if (event.type === 'user/message' && event.data?.source?.rpcId === this.#promptRpcId) {
         this.#targetTurn = event.data?.turn ?? this.#openTurn;
-        if (live) pushUpdate({ type: 'turn-start', turn: this.#targetTurn });
+        if (live || this.#hermesCard) pushUpdate({ type: 'turn-start', turn: this.#targetTurn });
         continue;
       }
       if (this.#targetTurn === null) continue;
@@ -767,7 +977,33 @@ export class HarnessReplyTracker {
         this.#finished = true;
         this.#reason = event.data?.reason ?? null;
         this.#openTurn = null;
-        if (live) {
+        // A lossy mux can miss stream-end. On a failed turn retract only
+        // uncommitted attempt drafts; durable assistant messages remain intact.
+        const reasonKind = this.#reason?.kind ?? this.#reason;
+        if (this.#hermesCard && reasonKind === 'error') {
+          for (const step of this.#hermesAttempts.keys()) {
+            if (this.#hermesCommittedSteps.has(step)) continue;
+            this.#assistantText.clearStep(step);
+            this.#hermesText.delete(step);
+            this.#hermesIndexed.delete(step);
+            this.#hermesEmittedText.delete(step);
+            pushUpdate({ type: 'text', step, text: '' });
+          }
+          this.#latestText = this.#assistantText.text;
+        }
+        if (this.#hermesCard) {
+          this.#hermesEndSeq = seq;
+          this.#hermesContext = fromMux ? null : terminalContext(terminalDisplay, ordered,
+            this.#hermesMetricsMessages, this.#targetTurn, seq, this.#reason);
+          this.#hermesTerminalDisplayApplied = Boolean(this.#hermesContext);
+          // Terminal status can invalidate a previously measured stream. Emit
+          // the final replacement before turn-end, not after adapter.finish().
+          const previous = this.#hermesLastMetrics;
+          this.#emitHermesMetrics(null, null, update => {
+            if (JSON.stringify(update) !== previous) pushUpdate(update);
+          });
+        }
+        if (live || this.#hermesCard) {
           pushUpdate({
             type: 'turn-end',
             turn: this.#targetTurn,
@@ -778,17 +1014,32 @@ export class HarnessReplyTracker {
       }
       if (event.data?.turn !== this.#targetTurn) continue;
 
+      if (this.#hermesCard && ['step/start', 'assistant/chunk', 'assistant/message', 'assistant/attempt'].includes(event.type)) {
+        if (Number.isSafeInteger(event.data?.step) && event.data.step >= 0) this.#hermesObservedSteps.add(event.data.step);
+        else this.#hermesRateInvalid = true;
+        if (event.type === 'assistant/attempt') this.#hermesRateInvalid = true;
+      }
       if (this.#finalAssistantText) accumulateFinalAssistantText(this.#finalAssistantText, event);
 
       if (event.type === 'assistant/chunk' && event.data?.chunk?.type === 'text-delta') {
+        if (this.#hermesCard) {
+          const key = `legacy:${seq}`;
+          if (this.#transientSeqs.has(key)) continue;
+          this.#transientSeqs.add(key);
+          if (this.#transientSeqs.size > 4096) this.#transientSeqs.delete(this.#transientSeqs.values().next().value);
+        }
         const step = event.data?.step ?? 0;
         const index = event.data.chunk.index ?? 0;
         this.#assistantText.appendDelta(step, index, event.data.chunk.text);
-        this.#commitText(this.#assistantText.text, pushUpdate);
+        this.#commitText(this.#assistantText.text, pushUpdate, step, event);
         continue;
       }
 
       if (event.type === 'assistant/message') {
+        if (this.#hermesCard && Number.isSafeInteger(event.data?.step)) {
+          this.#hermesCommittedSteps.add(event.data.step);
+          this.#hermesIndexed.delete(event.data.step);
+        }
         const text = assistantMessageText(event);
         const step = Number.isSafeInteger(event.data?.step) ? event.data.step : null;
         this.#assistantText.setCanonical(step, text);
@@ -808,9 +1059,13 @@ export class HarnessReplyTracker {
         // their pre-thinking-traces progress stream.
         if (this.#reasoning) {
           const reasoning = assistantReasoningText(event);
-          if (reasoning) pushUpdate({ type: 'reasoning', step, text: reasoning });
+          if (reasoning && (!this.#hermesCard || !this.#hermesReasoningSteps.has(step))) {
+            if (this.#hermesCard) this.#hermesReasoningSteps.add(step);
+            pushUpdate({ type: 'reasoning', step, text: reasoning });
+          }
         }
-        this.#commitText(this.#assistantText.text, pushUpdate);
+        this.#commitText(this.#assistantText.text, pushUpdate, step, event);
+        this.#emitHermesMetrics(event, step, pushUpdate);
         continue;
       }
 
@@ -840,11 +1095,29 @@ export class HarnessReplyTracker {
           ...(live ? { turn: this.#targetTurn } : {}),
         });
       } else if (event.type === 'tool/result') {
-        const callId = toolResultCallId(event.data);
+        const callId = (this.#hermesCard ? nonEmptyText(event.data?.message?.toolCallId) : null)
+          ?? toolResultCallId(event.data);
         const toolName = (callId ? this.#toolNames.get(callId) : null)
-          ?? this.#lastToolName;
+          ?? (this.#hermesCard && callId ? null : this.#lastToolName);
         const error = toolResultErrorText(event.data?.error);
-        if (live) {
+        if (this.#hermesCard) {
+          const data = event.data;
+          const blocks = Array.isArray(data?.message?.content) ? data.message.content : [];
+          const isError = Boolean(data?.error) || data?.isError === true || data?.message?.isError === true
+            || blocks.some((block) => block?.isError === true);
+          pushUpdate({
+            type: 'tool-result',
+            turn: this.#targetTurn,
+            ...(callId ? { callId } : {}),
+            ...(toolName ? { toolName } : {}),
+            text: toolResultText(data),
+            isError,
+            error: nonEmptyText(data?.error) ?? nonEmptyText(data?.error?.reason) ?? error
+              ?? (isError ? nonEmptyText(toolResultText(data)) : null),
+            ...(data?.error?.code !== undefined && data.error.code !== null
+              ? { errorCode: String(data.error.code) } : {}),
+          });
+        } else if (live) {
           const providerErrorCode = event.data?.error?.code;
           pushUpdate({
             type: 'tool-result',
@@ -864,6 +1137,15 @@ export class HarnessReplyTracker {
             ...(error ? { error } : {}),
           });
         }
+      }
+    }
+    if (this.#hermesCard && this.#finished && !fromMux && !this.#hermesTerminalDisplayApplied) {
+      const context = terminalContext(terminalDisplay, ordered, this.#hermesMetricsMessages,
+        this.#targetTurn, this.#hermesEndSeq, this.#reason);
+      if (context) {
+        this.#hermesContext = context;
+        this.#hermesTerminalDisplayApplied = true;
+        this.#emitHermesMetrics(null, null, pushUpdate);
       }
     }
     return updates;
@@ -1917,19 +2199,23 @@ export class HarnessClient {
     }
   }
 
-  async #replyHistory(sessionId, afterSeq, transferred, signal) {
+  async #replyHistory(sessionId, afterSeq, transferred, signal, hermesCard = false) {
     const events = [];
     let beforeSeq;
+    let terminalDisplay;
     for (let page = 0; page < 20; page += 1) {
       signal?.throwIfAborted();
       const history = await this.#sessionRpc('session.history', {
         sessionId, maxMessages: 50,
-        ...(beforeSeq === undefined ? {} : { beforeSeq }),
+        ...(beforeSeq === undefined ? (hermesCard === true ? { terminalDisplay: true } : {}) : { beforeSeq }),
       }, 30_000, { signal });
       signal?.throwIfAborted();
+      // Only the first/latest page owns this independent Host projection.
+      // Never inherit a snapshot from an older page or an incomplete replay.
+      if (page === 0) terminalDisplay = history.terminalDisplay;
       events.push(...(history.events ?? []));
       const oldest = Math.min(...(history.events ?? []).map((entry) => (entry.event ?? entry).seq));
-      if (!transferred || !history.hasMore || oldest <= afterSeq + 1) return { events };
+      if ((!transferred && hermesCard !== true) || !history.hasMore || oldest <= afterSeq + 1) return { events, terminalDisplay };
       if (!Number.isSafeInteger(oldest) || oldest === beforeSeq) break;
       beforeSeq = oldest;
     }
@@ -1971,15 +2257,51 @@ export class HarnessClient {
     const releasePromptInputOrigin = registerImInputOrigin(this.#interactionRegistry, promptRpcId);
     const tracker = new HarnessReplyTracker({
       promptRpcId, afterSeq: baselineSeq, reasoning, finalAnswerOnly: options.finalAnswerOnly,
+      hermesCard: options.hermesCard === true,
     });
     let checkedBlockedSeq = baselineSeq;
     let lastProgressAt = Date.now();
     let lastPollSeq = tracker.lastSeq;
     let progressTail = Promise.resolve();
-    const consumeProgress = (entries, { fromMux = false } = {}) => {
+    // HFC alone consumes full per-step snapshots. Replace only work which has
+    // not started, within a contiguous snapshot segment; never compact deltas,
+    // unknown steps, tools, metrics, lifecycle events or interaction barriers.
+    const pendingSnapshots = new Map();
+    const queueHermesProgress = (update) => {
+      const snapshot = ['text', 'assistant-message', 'reasoning'].includes(update.type)
+        && Number.isSafeInteger(update.step) && update.step >= 0
+        && typeof update.text === 'string';
+      const key = snapshot ? JSON.stringify([update.turn ?? tracker.turn, update.step,
+        update.type === 'reasoning' ? 'reasoning' : 'text']) : null;
+      if (!snapshot || (pendingSnapshots.size && !pendingSnapshots.has(key)
+        && [...pendingSnapshots.values()].some(slot => slot.update.step !== update.step))) pendingSnapshots.clear();
+      const existing = key === null ? null : pendingSnapshots.get(key);
+      if (existing) { existing.update = update; return; }
+      const slot = { update };
+      if (key !== null) pendingSnapshots.set(key, slot);
+      progressTail = progressTail.then(async () => {
+        if (key !== null && pendingSnapshots.get(key) === slot) pendingSnapshots.delete(key);
+        await onUpdate(slot.update);
+      }).catch(reportProgressFailure);
+    };
+    const reportProgressFailure = (error) => {
+      const detail = error instanceof Error ? error.message
+        : `${error?.errmsg ?? error?.body?.errmsg ?? '(no message)'} (errcode=${error?.errcode ?? error?.body?.errcode ?? 'unknown'})`;
+      console.warn('[dsh-im] ignored a progress update failure:', this.#logPrefix, detail);
+    };
+    const interactionBarrier = (callback) => !callback || options.hermesCard !== true ? callback : (value) => {
+      pendingSnapshots.clear();
+      const task = progressTail.then(() => callback(value));
+      // Keep callback failure visible to the interaction watcher; recover only
+      // the shared scheduling tail so subsequent owned events can still settle.
+      progressTail = task.catch(() => {});
+      return task;
+    };
+    const consumeProgress = (entries, { fromMux = false, terminalDisplay } = {}) => {
       const updates = tracker.consumeAll(entries, {
         live: progressMode === 'live',
         fromMux,
+        ...(options.hermesCard === true && !fromMux ? { terminalDisplay } : {}),
       });
       const seqAdvanced = tracker.lastSeq > lastPollSeq;
       lastPollSeq = tracker.lastSeq;
@@ -1991,6 +2313,7 @@ export class HarnessClient {
             .filter((update) => update.type !== 'assistant-message' && update.type !== 'reasoning')
             .slice(-1);
       for (const update of visibleUpdates) {
+        if (options.hermesCard === true) { queueHermesProgress(update); continue; }
         progressTail = progressTail
           .then(() => onUpdate(update))
           .catch((error) => {
@@ -2009,7 +2332,7 @@ export class HarnessClient {
       return progressTail;
     };
     const interactionController = onInteraction || onInteractionResolved
-      || (progressMode === 'live' && onUpdate)
+      || ((progressMode === 'live' || (progressMode === 'all' && options.hermesCard === true)) && onUpdate)
       ? new AbortController()
       : null;
     const interactionSignal = interactionController
@@ -2111,9 +2434,9 @@ export class HarnessClient {
         const opened = new Promise((resolve) => { markOpen = resolve; });
         interactionTask = this.watchInteractions(sessionId, {
           signal: interactionSignal,
-          onInteraction,
-          onResolved: onInteractionResolved,
-          onSessionEvent: progressMode === 'live'
+          onInteraction: interactionBarrier(onInteraction),
+          onResolved: interactionBarrier(onInteractionResolved),
+          onSessionEvent: (progressMode === 'live' || (progressMode === 'all' && options.hermesCard === true))
             ? (event) => { consumeProgress([event], { fromMux: true }); }
             : undefined,
           onOpen: markOpen,
@@ -2230,14 +2553,14 @@ export class HarnessClient {
         while (true) {
           await sleep(300, signal);
           options.assertCurrent?.();
-          const history = await this.#replyHistory(sessionId, tracker.lastSeq, Boolean(transferredPromptRpcId), signal);
+          const history = await this.#replyHistory(sessionId, tracker.lastSeq, Boolean(transferredPromptRpcId), signal, options.hermesCard === true);
           options.assertCurrent?.();
           const wasActive = ownership?.active === true;
           if (ownership) {
             this.#consumeInteractionOwnerships(sessionId, history.events ?? []);
             if (!wasActive && ownership.active) ownership.reconnect?.();
           }
-          await consumeProgress(history.events ?? []);
+          await consumeProgress(history.events ?? [], { terminalDisplay: history.terminalDisplay });
           if (tracker.finished) {
             turnFinished = true;
             if (!ownership?.stopRequested && !harnessTurnSucceeded(tracker.reason)) {

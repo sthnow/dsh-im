@@ -7,6 +7,8 @@ import { unlink } from 'node:fs/promises';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import HttpsProxyAgent from 'https-proxy-agent';
 import { createConnectionSupervisor } from './connection-supervisor.mjs';
+import { randomUUID } from 'node:crypto';
+import { createHfcDiagnosticRecorder } from './hfc-diagnostic-recorder.mjs';
 import { createHarnessCommandExecutor } from '../../harness-command-executor.mjs';
 import { harnessConnection } from '../../harness-connection.mjs';
 import { createHarnessSessionExecutors } from '../../harness-session-coordinator.mjs';
@@ -149,19 +151,122 @@ export async function createProductionController(ctx, config = {}, internals = {
   // State is lazy per bot. A corrupt legacy file can therefore fail only the
   // migrated bot and cannot prevent healthy v2 bots from starting.
   const stateStores = new Map();
+  // Factory-local tombstones deliberately never reopen: without a durable binding
+  // generation a later bot with the same id cannot safely be distinguished.
+  const retiredBots = new Set();
+  const bindings = new Map();
+  const mutators = new Set(['putDeferred', 'patchDeferred', 'removeDeferred', 'setMirror', 'clearMirror', 'flush', 'setSession', 'clearSession', 'clearSessions', 'markSeen', 'setWatch', 'removeWatch', 'clearWatches', 'setTopic', 'setIncludeArchivedSessions']);
+  const readers = new Set(['deferredEntries', 'mirrorEntries', 'sessionFor', 'hasSeen', 'snapshot', 'watchEntries', 'watchEntry', 'keysWatching', 'watchedSessionIds', 'topicRootFor', 'includesArchivedSessions']);
+  const retiredError = () => Object.assign(new Error('Feishu state binding is retired'), { code: 'FEISHU_STATE_RETIRED' });
+  const isV2 = (bot) => !!bot?.id && !!bot.secretRef && bot.secretRef !== LEGACY_FEISHU_SECRET_REF;
+  function retire(botId) {
+    retiredBots.add(botId);
+    const binding = bindings.get(botId);
+    if (binding) binding.retired = true;
+  }
+  // Read-only preflight: rejection must not retire a usable binding. Legacy
+  // state may be shared; its cleanup below preserves other configured owners.
+  function validateStateDeletion(botConfig) {
+    if (!isV2(botConfig)) return;
+    const key = stateKeyFor(resolve(statePathFor(botConfig)));
+    const binding = bindings.get(botConfig.id);
+    if (binding && (binding.key !== key || binding.secretRef !== botConfig.secretRef || binding.appId !== botConfig.appId)) {
+      throw new Error('Cannot safely delete a rebound Feishu state');
+    }
+    if (!canListConfiguredBots || listConfiguredBots().some((other) => other.id !== botConfig.id && stateKeyFor(resolve(statePathFor(other))) === key)) {
+      throw new Error('Cannot safely delete shared Feishu state');
+    }
+  }
+  function facadeFor(store, binding) {
+    // Preserve reference identity for each underlying mirror version without
+    // exposing the store's mutable objects to callers.
+    const mirrorSnapshots = new WeakMap();
+    function freezeSnapshot(value, seen = new WeakSet()) {
+      if (!value || typeof value !== 'object' || seen.has(value)) return value;
+      seen.add(value);
+      for (const child of Object.values(value)) freezeSnapshot(child, seen);
+      return Object.freeze(value);
+    }
+    return new Proxy(store, {
+      get(target, property) {
+        const value = Reflect.get(target, property, target);
+        if (typeof value !== 'function') return value;
+        if (mutators.has(property)) return (...args) => {
+          if (binding.retired) return Promise.reject(retiredError());
+          // StateStore retains the supplied mirror object, so detach it before
+          // storing; later caller mutations must not bypass persistence.
+          const callArgs = property === 'setMirror' ? [args[0], structuredClone(args[1])] : args;
+          const result = value.apply(target, callArgs);
+          if (result && typeof result.then === 'function') {
+            const pending = Promise.resolve(result);
+            binding.pending.add(pending);
+            pending.then(() => binding.pending.delete(pending), () => binding.pending.delete(pending));
+          }
+          return result;
+        };
+        if (readers.has(property)) return (...args) => {
+          const result = value.apply(target, args);
+          if (property === 'mirrorEntries') return result.map(([key, entry]) => {
+            if (!entry || typeof entry !== 'object') return [key, entry];
+            let snapshot = mirrorSnapshots.get(entry);
+            if (!snapshot) {
+              snapshot = freezeSnapshot(structuredClone(entry));
+              mirrorSnapshots.set(entry, snapshot);
+            }
+            return [key, snapshot];
+          });
+          return result && typeof result === 'object' ? structuredClone(result) : result;
+        };
+        // Unknown methods are not assumed read-only; load and future mutators
+        // must not provide a route around retirement or drain tracking.
+        return () => { throw new Error(`Unsupported Feishu state method: ${String(property)}`); };
+      },
+      set() { throw new Error('Feishu state facade is read-only'); },
+    });
+  }
   const statePathFor = (botConfig) => !botConfig.id
     || !botConfig.secretRef
     || botConfig.secretRef === LEGACY_FEISHU_SECRET_REF
     ? paths.legacyState
     : resolve(paths.bots, botConfig.id, 'state.json');
-  const stateFor = async (botConfig) => {
-    const stateKey = botConfig.id ?? '__legacy__';
-    let state = stateStores.get(stateKey);
-    if (!state) {
-      state = await new SessionStateStore(statePathFor(botConfig)).load();
-      stateStores.set(stateKey, state);
+  // Paths, rather than bot IDs, identify the file: legacy bots may share it.
+  // Windows paths are case-insensitive in the supported default filesystem.
+  const stateKeyFor = (path) => process.platform === 'win32' ? path.toLowerCase() : path;
+  const stateFor = (botConfig) => {
+    const statePath = resolve(statePathFor(botConfig));
+    const stateKey = stateKeyFor(statePath);
+    let binding;
+    if (isV2(botConfig)) {
+      if (retiredBots.has(botConfig.id)) throw retiredError();
+      binding = bindings.get(botConfig.id);
+      if (binding && (binding.key !== stateKey || binding.secretRef !== botConfig.secretRef || binding.appId !== botConfig.appId)) {
+        retire(botConfig.id);
+        throw new Error('Cannot safely rebind Feishu state');
+      }
+      if (!binding) {
+        binding = { key: stateKey, secretRef: botConfig.secretRef, appId: botConfig.appId, retired: false, pending: new Set() };
+        bindings.set(botConfig.id, binding);
+      }
     }
-    return state;
+    let loading = stateStores.get(stateKey);
+    if (!loading) {
+      // Register the promise before starting asynchronous I/O; all cold callers
+      // then share both the load and the resulting store/write queue.
+      loading = Promise.resolve().then(() => new SessionStateStore(statePath).load());
+      stateStores.set(stateKey, loading);
+      loading.catch(() => {
+        if (stateStores.get(stateKey) === loading) stateStores.delete(stateKey);
+      });
+    }
+    if (!binding) return loading; // Preserve legacy shared identity and behavior.
+    if (!binding.loading) {
+      binding.loading = loading.then((store) => {
+        if (binding.retired) throw retiredError();
+        return facadeFor(store, binding);
+      });
+      binding.loading.catch(() => { binding.loading = null; });
+    }
+    return binding.loading;
   };
   const stateForBotId = async (botId) => {
     const botConfig = listConfiguredBots().find((bot) => bot.id === botId);
@@ -219,6 +324,8 @@ export async function createProductionController(ctx, config = {}, internals = {
     credentials: ctx.credentials,
     configStore: observedConfigStore,
     createRuntime: async ({ botId, config: botConfig, appSecret, repair, acceptExternal }) => {
+      // Runtime-local display partition, never read from profiles or callbacks.
+      const hfcRuntimeNamespace = randomUUID();
       const state = await stateFor(botConfig);
       const id = botId ?? botConfig.id ?? botConfig.appId;
       await workspaces.ensure(id, {
@@ -254,6 +361,9 @@ export async function createProductionController(ctx, config = {}, internals = {
         stepPush: botConfig.stepPush,
         stepPushMode: botConfig.stepPushMode,
         stepCardPanels: botConfig.stepCardPanels,
+        hfcPresentation: botConfig.hfcPresentation,
+        hfcRuntimeNamespace,
+        hfcDiagnostic: createHfcDiagnosticRecorder(join(paths.bots, id, 'hfc-diagnostics.json')),
         voice: voiceSource,
         sessionSyncTargetsFor: sessionSyncTargetsFor,
         ownerOpenIds: botConfig.ownerOpenIds ?? [botConfig.ownerOpenId],
@@ -276,16 +386,37 @@ export async function createProductionController(ctx, config = {}, internals = {
         },
       });
     },
-    deleteState: async ({ botId, config: botConfig }) => {
-      stateStores.delete(botId);
+    validateStateDeletion: ({ config: botConfig }) => validateStateDeletion(botConfig),
+    beginStateDeletion: ({ config: botConfig }) => {
+      // Legacy still exposes its physical store to preserve shared lock identity.
+      // Do not pretend that retiring a bot revokes those old raw references.
+      if (isV2(botConfig)) retire(botConfig.id);
+    },
+    deleteState: async ({ config: botConfig }) => {
+      const statePath = resolve(statePathFor(botConfig));
+      const stateKey = stateKeyFor(statePath);
+      if (!isV2(botConfig)) {
+        // Unknown ownership or another legacy owner: retain the entire file,
+        // including sessions. The shared store cannot be partitioned per bot.
+        if (!canListConfiguredBots || listConfiguredBots().some((other) =>
+          other.id !== botConfig.id && stateKeyFor(resolve(statePathFor(other))) === stateKey)) return;
+      }
+      const loading = stateStores.get(stateKey);
+      const store = loading ? await loading.catch(() => null) : null;
+      const binding = bindings.get(botConfig.id);
+      if (binding) await Promise.allSettled([...binding.pending]);
+      // Drain the physical queue too (including writes begun before a facade
+      // tracked them). Legacy last-owner cleanup remains best effort: retained
+      // raw references are NOT revoked and may write again after this drain.
+      if (store) await store.flush();
       try {
-        await unlink(statePathFor(botConfig));
+        await unlink(statePath);
       } catch (error) {
         if (error?.code !== 'ENOENT') throw error;
       }
     },
   });
-  const controller = createWorkspaceAwareController(coreController, {
+  const workspaceController = createWorkspaceAwareController(coreController, {
     harness,
     workspaces,
     stateFor: stateForBotId,
@@ -300,6 +431,20 @@ export async function createProductionController(ctx, config = {}, internals = {
         error.code = 'access-policy-invalid';
         throw error;
       }
+    },
+  });
+
+  const controller = new Proxy(workspaceController, {
+    get(target, property) {
+      if (property === 'deleteBot' || property === 'disconnect') return async (...args) => {
+        // The generic workspace wrapper clears sessions before the controller's
+        // preflight/pending commit, and would clear other legacy owners too.
+        // Feishu removes workspaces through observedConfigStore only after its
+        // config commit (also for internal cancellation and disconnect paths).
+        await coreController[property](...args);
+        return target.status();
+      };
+      return Reflect.get(target, property, target);
     },
   });
 

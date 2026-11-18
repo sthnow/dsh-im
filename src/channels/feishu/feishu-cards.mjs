@@ -1249,7 +1249,7 @@ function splitMarkdownByTableLimit(text, maxTables) {
 /** Count the Markdown that stepStreamCard actually renders. */
 function stepStreamCardTableCount(blocks) {
   return blocks.reduce((sum, block) => {
-    const text = block?.kind === 'notes' || block?.kind === 'tools'
+    const text = block?.kind === 'notes' || block?.kind === 'tools' || block?.kind === 'reasoning'
       ? (block.lines ?? []).filter((line) => typeof line === 'string' && line.trim()).join('\n')
       : block?.text;
     return sum + countMarkdownTables(text);
@@ -1259,7 +1259,7 @@ function stepStreamCardTableCount(blocks) {
 /** Split display copies; the bridge's logical blocks and answer indices stay intact. */
 export function splitBlockByTableLimit(block, maxTables = STEP_STREAM_CARD_MAX_TABLES) {
   if (!block || typeof block !== 'object' || !Number.isInteger(maxTables) || maxTables < 1) return [block];
-  if (block.kind === 'notes' || block.kind === 'tools') {
+  if (block.kind === 'notes' || block.kind === 'tools' || block.kind === 'reasoning') {
     const lines = (block.lines ?? []).filter((line) => typeof line === 'string' && line.trim());
     if (countMarkdownTables(lines.join('\n')) <= maxTables) return [block];
     const groups = [];
@@ -1293,6 +1293,7 @@ export function splitStepStreamCardBlocks(
   limit = STEP_STREAM_CARD_MAX_BYTES,
   maxTables = STEP_STREAM_CARD_MAX_TABLES,
   stepCardPanels,
+  renderCard = stepStreamCard,
 ) {
   // A single block can carry more tables than a card accepts — one short answer
   // with six small tables — and splitting only between blocks cannot help. Each
@@ -1305,7 +1306,7 @@ export function splitStepStreamCardBlocks(
   const chunks = [];
   let current = [];
   for (const block of list) {
-    const tooLarge = Buffer.byteLength(stepStreamCard([...current, block], { stepCardPanels }), 'utf8') > limit;
+    const tooLarge = Buffer.byteLength(renderCard([...current, block], { stepCardPanels }), 'utf8') > limit;
     const tooManyTables = stepStreamCardTableCount([...current, block]) > maxTables;
     if (current.length > 0 && (tooLarge || tooManyTables)) {
       chunks.push(current);

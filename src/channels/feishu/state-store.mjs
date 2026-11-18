@@ -76,6 +76,11 @@ export class StateStore {
     return Object.entries(this.#state.mirrors ?? {});
   }
 
+  /** Queue a fresh snapshot, including mutations whose earlier write failed. */
+  flush() {
+    return this.#persist();
+  }
+
   sessionFor(key) {
     return this.#state.sessions[key] ?? null;
   }

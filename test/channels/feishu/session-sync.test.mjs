@@ -585,6 +585,183 @@ for (const phase of ['running', 'finish']) {
   });
 }
 
+test('orphan recovery never delivers after unbinding and resumes after a matching rebind', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const saved = await savedMirror(t);
+  let targets = [];
+  const f = await fixture(t, { sync: false, state: saved.state, history: completedHistory,
+    resolver: async () => targets });
+  await f.drain();
+  assert.equal(f.historyCalls.length, 0);
+  assert.equal(f.patches.length, 0);
+  assert.equal(saved.state.mirrorEntries().length, 1);
+  targets = [{ ...target, openId: 'ou_other' }];
+  t.mock.timers.tick(30000); await f.drain();
+  assert.equal(f.patches.length, 0);
+  assert.equal(saved.state.mirrorEntries().length, 1);
+  targets = [{ ...target, openId: 'ou_owner' }];
+  t.mock.timers.tick(30000); await f.drain();
+  assert.equal(f.patches.length, 1);
+  assert.deepEqual(saved.state.mirrorEntries(), []);
+});
+
+for (const mode of ['unbound', 'resolver-error', 'missing-target']) {
+  test(`unverified ${mode} records remain bounded by retention and never deliver`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_800_000_000_000 });
+    const saved = await savedMirror(t, { claimedAt: null, ...(mode === 'missing-target' ? { targetId: undefined } : {}) });
+    const f = await fixture(t, { sync: false, state: saved.state, history: completedHistory,
+      resolver: async () => { if (mode === 'resolver-error') throw new Error('offline'); return mode === 'unbound' ? [] : [{ ...target, openId: 'ou_owner' }]; } });
+    await f.drain();
+    assert.equal(saved.state.mirrorEntries()[0][1].claimedAt, Date.now());
+    assert.equal(f.historyCalls.length, 0);
+    assert.equal(f.patches.length, 0);
+    t.mock.timers.tick(MIRROR_TTL); await f.drain();
+    assert.deepEqual(saved.state.mirrorEntries(), []);
+    assert.equal(f.patches.length, 0);
+  });
+}
+
+test('failure-limit cleanup does not require an available target resolver', async t => {
+  const saved = await savedMirror(t, { recoveryFailures: 20 });
+  const f = await fixture(t, { sync: false, state: saved.state, history: completedHistory,
+    resolver: async () => { throw new Error('offline'); } });
+  await f.drain();
+  assert.deepEqual(saved.state.mirrorEntries(), []);
+  assert.equal(f.historyCalls.length, 0);
+  assert.equal(f.patches.length, 0);
+});
+
+test('binding retry timer is cancelled after live adoption finishes the saved mirror', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const saved = await savedMirror(t);
+  let enabled = false, lookups = 0;
+  const f = await fixture(t, { sync: false, state: saved.state, history: completedHistory,
+    resolver: async () => { lookups++; return enabled ? [{ ...target, openId: 'ou_owner' }] : []; } });
+  await f.drain();
+  enabled = true;
+  f.emit(answer()); f.emit(end()); await f.drain();
+  assert.equal(saved.state.mirrorEntries().length, 0);
+  const before = lookups;
+  t.mock.timers.tick(30000); await f.drain();
+  assert.equal(lookups, before, 'clearing the mirror cancels its binding retry');
+});
+
+test('orphan recovery rechecks binding after an in-flight history lookup', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const saved = await savedMirror(t);
+  let targets = [{ ...target, openId: 'ou_owner' }];
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const f = await fixture(t, { sync: false, state: saved.state,
+    resolver: async () => targets, history: async () => { await gate; return { events: completedHistory, hasMore: false }; } });
+  targets = [];
+  release();
+  await f.drain();
+  assert.equal(f.patches.length, 0);
+  assert.equal(saved.state.mirrorEntries().length, 1);
+});
+
+test('failed clear flushes current tombstone without repeating delivery or blocking other records', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const saved = await savedMirror(t);
+  const records = new Map([[saved.key, saved.entry], ['other', { ...saved.entry, sessionId: 'other' }]]);
+  let durable = new Map(records), failures = 0, flushes = 0;
+  const state = {
+    mirrorEntries: () => [...records],
+    clearMirror: async key => {
+      records.delete(key);
+      if (key === saved.key && failures++ === 0) throw Object.assign(new Error('rename EPERM'), { code: 'EPERM' });
+      durable = new Map(records);
+    },
+    setMirror: async (key, entry) => { records.set(key, entry); durable = new Map(records); },
+    flush: async () => { flushes++; durable = new Map(records); },
+  };
+  const f = await fixture(t, { sync: false, state, history: completedHistory });
+  await f.drain();
+  assert.equal(f.patches.length, 2);
+  assert.equal(records.size, 0);
+  t.mock.timers.tick(1000); await f.drain();
+  assert.equal(flushes, 1);
+  assert.equal(durable.size, 0);
+  assert.equal(f.patches.length, 2);
+});
+
+test('claim persistence retries with bounded backoff without consuming remote failure budget and stops on abort', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const saved = await savedMirror(t, { claimedAt: null });
+  let current = saved.entry, writes = 0, flushes = 0;
+  const state = {
+    mirrorEntries: () => current ? [[saved.key, current]] : [],
+    setMirror: async (_key, entry) => { current = entry; writes++; throw new Error('EPERM'); },
+    clearMirror: async () => { current = null; },
+    flush: async () => { flushes++; throw new Error('EPERM'); },
+  };
+  const f = await fixture(t, { sync: false, state, history: completedHistory });
+  await f.drain();
+  assert.equal(writes, 1);
+  assert.equal(current.recoveryFailures, undefined);
+  assert.equal(f.historyCalls.length, 0);
+  t.mock.timers.tick(1000); await f.drain();
+  assert.equal(flushes, 1);
+  t.mock.timers.tick(1999); await f.drain();
+  assert.equal(flushes, 1);
+  f.close();
+  t.mock.timers.tick(60000); await f.drain();
+  assert.equal(flushes, 1);
+});
+
+for (const legacy of [false, true]) {
+  test(`concurrent replacement survives exhausted ${legacy ? 'legacy' : 'block'} recovery persistence`, async t => {
+    const saved = await savedMirror(t, { recoveryFailures: 19, ...(legacy ? { blocks: undefined } : {}) });
+    let current = saved.entry, release, entered;
+    const gate = new Promise(resolve => { release = resolve; });
+    const started = new Promise(resolve => { entered = resolve; });
+    t.after(release);
+    let clears = 0;
+    const state = {
+      mirrorEntries: () => current ? [[saved.key, current]] : [],
+      setMirror: (_key, entry) => {
+        // StateStore replaces memory synchronously before returning its I/O promise.
+        current = entry;
+        if (entry.recoveryFailures === 20) { entered(); return gate; }
+        return Promise.resolve();
+      },
+      clearMirror: () => { clears++; current = null; return Promise.resolve(); },
+    };
+    const f = await fixture(t, { sync: false, state, history: completedHistory,
+      patch: async () => { throw new Error('offline'); } });
+    await started;
+    const replacement = { ...saved.entry, sessionId: 'new-session', cardIds: ['new-card'], recoveryFailures: 0 };
+    await state.setMirror(saved.key, replacement);
+    release();
+    await f.drain();
+    assert.equal(current, replacement, 'old recovery must not clear the replacement');
+    assert.equal(clears, 0);
+  });
+}
+
+test('replacement during legacy claim persistence is not cleared at the old failure limit', async t => {
+  const saved = await savedMirror(t, { claimedAt: null, recoveryFailures: 20, blocks: undefined });
+  let current = saved.entry, release, entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  t.after(release);
+  let clears = 0;
+  const state = {
+    mirrorEntries: () => current ? [[saved.key, current]] : [],
+    setMirror: (_key, entry) => { current = entry; entered(); return gate; },
+    clearMirror: () => { clears++; current = null; return Promise.resolve(); },
+  };
+  const f = await fixture(t, { sync: false, state, history: completedHistory });
+  await started;
+  const replacement = { ...saved.entry, sessionId: 'new-session', recoveryFailures: 0, claimedAt: Date.now() };
+  current = replacement;
+  release(); await f.drain();
+  assert.equal(current, replacement);
+  assert.equal(clears, 0);
+  assert.equal(f.historyCalls.length, 0);
+});
+
 test('recovery failure budget survives file reload and expires on the twentieth failure', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const saved = await savedMirror(t);
@@ -616,6 +793,38 @@ test('recovery failure budget survives file reload and expires on the twentieth 
   t.mock.timers.tick(90_000); await second.drain();
   assert.equal(second.patches.length, 2);
   assert.deepEqual((await new StateStore(path).load()).mirrorEntries(), []);
+});
+
+test('waitForIdle includes the entire startup recovery of multiple orphan mirrors', async t => {
+  const saved = await savedMirror(t);
+  const secondKey = saved.key.slice(0, -1) + '2';
+  await saved.state.setMirror(secondKey, { ...saved.entry, turn: 2, cardIds: ['card-two'] });
+  let releaseFirst, releaseSecond, enteredFirst, enteredSecond;
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  const secondGate = new Promise(resolve => { releaseSecond = resolve; });
+  const firstEntered = new Promise(resolve => { enteredFirst = resolve; });
+  const secondEntered = new Promise(resolve => { enteredSecond = resolve; });
+  t.after(() => { releaseFirst(); releaseSecond(); });
+  const f = await fixture(t, { sync: false, state: saved.state,
+    history: [...completedHistory, start(2), user(2), answer('second', 2), end(2)],
+    patch: async request => {
+      if (request.path.message_id === 'card-two') { enteredSecond(); await secondGate; }
+      else { enteredFirst(); await firstGate; }
+    },
+  });
+  await firstEntered;
+  let idle = false;
+  const waiting = f.bridge.waitForIdle().then(() => { idle = true; });
+  releaseFirst();
+  await secondEntered;
+  await tick(); // let promise continuations run while the second PATCH remains gated
+  try {
+    assert.equal(idle, false, 'idle must not resolve before the second recovery finishes');
+  } finally {
+    releaseSecond();
+    await waiting;
+  }
+  assert.deepEqual(saved.state.mirrorEntries(), []);
 });
 
 test('each failed orphan retries only itself and deleted entries never reappear', async t => {

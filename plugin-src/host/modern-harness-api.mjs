@@ -4,6 +4,7 @@ import { activeHarnessInteractionOwner, clearModelCatalogCache, hasActiveHarness
 import { extractConnectionEvidence } from '../../src/channels/shared/connection-error.mjs';
 import { harnessPeer } from './harness-peer.mjs';
 import { sameWorkspacePath } from '../../src/channels/shared/default-workspace.mjs';
+import { terminalDisplaySnapshot } from './terminal-display-snapshot.mjs';
 
 const modernApis = new WeakMap();
 
@@ -69,6 +70,30 @@ function sessionEvents(session) {
   }
   const events = session?.events;
   return Array.isArray(events) ? events : null;
+}
+
+// Only raw contiguous log events can prove the closest lifecycle boundary.
+// The target itself must still be the committed event; a surface/page is not a log.
+function goalTurnFromSession(session, event) {
+  if (event?.type !== 'user/message' || event.data?.source?.kind !== 'goal'
+    || event.data?.turn !== undefined || !Number.isSafeInteger(event.seq) || event.seq < 0
+    || typeof session?.eventAt !== 'function') return event;
+  try {
+    const target = session.eventAt(event.seq);
+    if (target !== event && JSON.stringify(target) !== JSON.stringify(event)) return event;
+    // Bound synchronous callback work; very long or incomplete prefixes fail closed.
+    const floor = Math.max(0, event.seq - 4096);
+    for (let seq = event.seq - 1; seq >= floor; seq--) {
+      const item = session.eventAt(seq);
+      if (!item || item.seq !== seq) return event;
+      if (item.type === 'turn/end') return event;
+      if (item.type === 'turn/start') {
+        if (!Number.isSafeInteger(item.data?.turn)) return event;
+        return { ...event, data: { ...event.data, turn: item.data.turn } };
+      }
+    }
+  } catch { /* unavailable log: do not infer */ }
+  return event;
 }
 
 function matchesQuestions(value, pending) {
@@ -205,6 +230,7 @@ class MuxSubscription {
 
 class ModernHarnessApi {
   #gateway;
+  #ctx;
   #peer;
   #deliveryService;
   #scope;
@@ -212,11 +238,15 @@ class ModernHarnessApi {
   #pendingQuestions = new Map();
   #pendingApprovals = new Map();
   #sessionCursors = new Map();
+  #liveSessions = new Map();
   #assistantStreams = new Map();
+  // Monotonic within this adapter lifetime, shared by mux and history snapshots.
+  #assistantAttemptEpoch = 0;
   #disposers = [];
   #disposed = false;
 
   constructor(ctx, gateway, scope) {
+    this.#ctx = ctx;
     this.#gateway = gateway;
     this.#scope = scope;
     this.#peer = harnessPeer(ctx);
@@ -280,14 +310,20 @@ class ModernHarnessApi {
         const sessionId = session?.id;
         if (typeof sessionId !== 'string' || !event || typeof event !== 'object') return;
         if (Number.isSafeInteger(event.seq)) this.#rememberCursor(sessionId, event.seq);
-        this.#broadcast({ type: 'session/event', sessionId, event });
+        this.#liveSessions.delete(sessionId);
+        this.#liveSessions.set(sessionId, session);
+        if (this.#liveSessions.size > 128) this.#liveSessions.delete(this.#liveSessions.keys().next().value);
+        this.#broadcast({ type: 'session/event', sessionId, event: goalTurnFromSession(session, event) });
       }, { global: true }));
       this.#disposers.push(ctx.on('agent/assistant-stream', ({ agent, frame }) => {
         this.#acceptAssistantStream(agent, frame);
       }, { global: true }));
       this.#disposers.push(ctx.on('agent/disposed', ({ agent }) => {
-        const sessionId = agent?.session?.id;
-        if (typeof sessionId === 'string') this.#assistantStreams.delete(sessionId);
+        const sessionId = agent?.session?.id ?? agent?.id;
+        if (typeof sessionId === 'string') {
+          this.#assistantStreams.delete(sessionId);
+          this.#liveSessions.delete(sessionId);
+        }
       }, { global: true }));
       this.#disposers.push(ctx.on(
         'approval/request',
@@ -386,11 +422,14 @@ class ModernHarnessApi {
       const snapshot = await this.#sessionSnapshot(sessionId, maxMessages, signal);
       cursor = this.#sessionCursors.get(sessionId) ?? snapshot.cursor;
       if (beforeSeq === undefined && cursor === snapshot.cursor) {
-        return {
-          events: this.#withAssistantStream(sessionId, historyEntries(snapshot.records)),
+        const history = {
+          events: this.#withAssistantStream(sessionId, this.#enrichHistory(sessionId, historyEntries(snapshot.records))),
           hasMore: snapshot.hasMore === true,
           ...(snapshot.projections === undefined ? {} : { projections: snapshot.projections }),
         };
+        return payload.terminalDisplay === true
+          ? this.#withTerminalDisplay(sessionId, cursor, history, signal)
+          : history;
       }
     }
     const page = await this.#invoke('session', 'page', {
@@ -401,16 +440,46 @@ class ModernHarnessApi {
         ...(beforeSeq === undefined ? {} : { beforeSeq }),
       },
     }, signal);
-    return {
+    const history = {
       events: beforeSeq === undefined
-        ? this.#withAssistantStream(sessionId, historyEntries(page.records))
-        : historyEntries(page.records),
+        ? this.#withAssistantStream(sessionId, this.#enrichHistory(sessionId, historyEntries(page.records)))
+        : this.#enrichHistory(sessionId, historyEntries(page.records)),
       hasMore: page.hasMore === true,
     };
+    return beforeSeq === undefined && payload.terminalDisplay === true
+      ? this.#withTerminalDisplay(sessionId, cursor, history, signal)
+      : history;
+  }
+
+  async #withTerminalDisplay(sessionId, asOfSeq, history, signal) {
+    // The authorized history RPC must succeed before optional domain inspection.
+    // Any unavailable service or stale cut removes only display enrichment.
+    try {
+      if (signal?.aborted || this.#disposed || this.#assistantStreams.has(sessionId)) return history;
+      const tokenMeter = this.#ctx.get?.('tokenMeter') ?? this.#ctx.tokenMeter;
+      if (typeof tokenMeter?.contextPressure !== 'function') return history;
+      const query = this.#ctx.get?.('sessionQuery') ?? this.#ctx.sessionQuery;
+      const read = session => terminalDisplaySnapshot(session, tokenMeter, {
+        sessionId, asOfSeq, entries: history.events,
+      });
+      const terminalDisplay = typeof query?.inspectSession === 'function'
+        ? await query.inspectSession(sessionId, read, signal)
+        : read(this.#liveSessions.get(sessionId));
+      if (terminalDisplay && !signal?.aborted && !this.#disposed
+        && !this.#assistantStreams.has(sessionId) && this.#sessionCursors.get(sessionId) === asOfSeq) {
+        return { ...history, terminalDisplay };
+      }
+    } catch { /* Optional display must never turn successful history into failure. */ }
+    return history;
+  }
+
+  #enrichHistory(sessionId, entries) {
+    const session = this.#liveSessions.get(sessionId);
+    return entries.map(entry => ({ ...entry, event: goalTurnFromSession(session, entry.event) }));
   }
 
   #acceptAssistantStream(agent, frame) {
-    const sessionId = agent?.session?.id;
+    const sessionId = agent?.session?.id ?? agent?.id;
     if (typeof sessionId !== 'string' || !frame || typeof frame !== 'object') return;
     if (frame.type === 'start') {
       const nextSeq = agent?.session?.seq;
@@ -419,6 +488,7 @@ class ModernHarnessApi {
         : this.#sessionCursors.get(sessionId) ?? -1;
       this.#assistantStreams.set(sessionId, {
         attemptId: frame.attemptId,
+        attemptEpoch: ++this.#assistantAttemptEpoch,
         turn: frame.turn,
         step: frame.step,
         startedAfterSeq,
@@ -429,6 +499,9 @@ class ModernHarnessApi {
     const stream = this.#assistantStreams.get(sessionId);
     if (!stream || stream.attemptId !== frame.attemptId) return;
     if (frame.type === 'end') {
+      this.#broadcast({ type: 'session/event', sessionId, event: {
+        type: 'assistant/stream-end', data: { turn: stream.turn, step: stream.step, attemptId: stream.attemptId, attemptEpoch: stream.attemptEpoch, outcome: frame.outcome },
+      } });
       this.#assistantStreams.delete(sessionId);
       return;
     }
@@ -441,7 +514,7 @@ class ModernHarnessApi {
         // before the durable assistant/message that replaces them.
         seq: stream.startedAfterSeq + 1 - 1 / (frame.index + 2),
         time: frame.time,
-        data: { turn: stream.turn, step: stream.step, chunk: frame.chunk },
+        data: { turn: stream.turn, step: stream.step, attemptId: stream.attemptId, attemptEpoch: stream.attemptEpoch, streamIndex: frame.index, chunk: frame.chunk },
       },
     };
     stream.entries.push(entry);
@@ -947,6 +1020,7 @@ class ModernHarnessApi {
     clearModelCatalogCache(this);
     for (const subscription of [...this.#mux]) subscription.close();
     this.#assistantStreams.clear();
+    this.#liveSessions.clear();
     for (const pending of [...this.#pendingApprovals.values()]) pending.settle('cancelled');
     for (const pending of [...this.#pendingQuestions.values()]) pending.settle(
       'cancelled',

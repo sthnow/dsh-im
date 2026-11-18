@@ -593,6 +593,36 @@ test('modern adapter retains safe transport evidence through Harness RPC and mes
   }
 });
 
+test('goal turn attribution uses contiguous committed raw boundaries for mux and history', async () => {
+  const goal = { type: 'user/message', seq: 3, data: { source: { kind: 'goal', round: 1 } } };
+  const events = [
+    { type: 'turn/start', seq: 0, data: { turn: 1 } },
+    { type: 'turn/end', seq: 1, data: { turn: 1 } },
+    { type: 'turn/start', seq: 2, data: { turn: 2 } }, goal,
+    { type: 'turn/start', seq: 4, data: { turn: 3 } },
+  ];
+  const { ctx, emit } = fakeContext({
+    stream() { return asyncValues({ type: 'snapshot', cursor: 4, records: [{ type: 'event', event: structuredClone(goal) }], hasMore: true }); },
+    async invoke() { return { records: [{ type: 'event', event: structuredClone(goal) }], hasMore: true }; },
+  });
+  const api = modernHarnessApi(ctx);
+  const controller = new AbortController();
+  const mux = api.events.mux({}, controller.signal);
+  const session = { id: 'session', eventAt: seq => events[seq] };
+  emit('session/event', session, goal);
+  assert.equal((await mux.next()).value.payload.event.data.turn, 2);
+  assert.equal(goal.data.turn, undefined, 'the committed event is not mutated');
+  const history = await api.sessions.history({ rpcId: 'history', payload: { sessionId: 'session' } });
+  assert.equal(history.result.value.events[0].event.data.turn, 2);
+  events[2] = undefined;
+  emit('session/event', session, goal);
+  assert.equal((await mux.next()).value.payload.event.data.turn, undefined);
+  events[2] = { type: 'turn/end', seq: 2, data: { turn: 1 } };
+  emit('session/event', session, goal);
+  assert.equal((await mux.next()).value.payload.event.data.turn, undefined);
+  controller.abort();
+});
+
 test('modern adapter exposes DSH v2 live assistant chunks through legacy history', async () => {
   const records = [
     {
