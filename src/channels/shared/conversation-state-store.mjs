@@ -1,5 +1,6 @@
 import { deferredStateAccess, normalizeDeferredState } from './deferred-state.mjs';
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { renameWithRetry } from './rename-with-retry.mjs';
 import { dirname } from 'node:path';
 
 /**
@@ -314,7 +315,7 @@ export class ConversationStateStore {
       await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
       const temporary = `${this.#path}.tmp`;
       await writeFile(temporary, snapshot, { encoding: 'utf8', mode: 0o600 });
-      await rename(temporary, this.#path);
+      await renameWithRetry(temporary, this.#path);
     });
     this.#writeQueue = operation.then(() => undefined, () => undefined);
     await operation;

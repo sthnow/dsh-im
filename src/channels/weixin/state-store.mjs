@@ -1,7 +1,8 @@
 import { weixinStageError } from './connection-error.mjs';
 import { deferredStateAccess, normalizeDeferredState } from '../shared/deferred-state.mjs';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { renameWithRetry } from '../shared/rename-with-retry.mjs';
 import { dirname } from 'node:path';
 
 import { weixinMessageTimestampMs } from './weixin-api.mjs';
@@ -283,7 +284,7 @@ export class WeixinStateStore {
       await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
       const temporary = `${this.#path}.tmp`;
       await writeFile(temporary, snapshot, { encoding: 'utf8', mode: 0o600 });
-      await rename(temporary, this.#path);
+      await renameWithRetry(temporary, this.#path);
     });
     this.#writeQueue = operation.then(() => undefined, () => undefined);
     await operation.catch(error => { throw weixinStageError('account-state-write-failed', error); });

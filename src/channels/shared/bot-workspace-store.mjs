@@ -9,7 +9,6 @@ import {
   mkdir,
   readFile,
   realpath,
-  rename,
   stat,
   unlink,
   writeFile,
@@ -48,6 +47,7 @@ import {
   workspaceManualEditDisabled,
 } from './conversation-directory.mjs';
 import { conversationDirectoryName, prepareDirectoryPath } from './conversation-directory-ensure.mjs';
+import { renameWithRetry } from './rename-with-retry.mjs';
 
 const DELIVERY_DOCUMENT_VERSION = 2;
 const SESSION_SYNC_DOCUMENT_VERSION = 3;
@@ -460,7 +460,7 @@ async function writeStoredDocument(path, document) {
     encoding: 'utf8',
     mode: 0o600,
   });
-  await rename(temporary, path);
+  await renameWithRetry(temporary, path);
 }
 
 export async function validateWorkspacePath(value, { ungroupedWorkspace } = {}) {
