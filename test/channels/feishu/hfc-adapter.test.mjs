@@ -24,9 +24,9 @@ function setup({ events, budgets, nativeResult = receipt, patchError } = {}) {
 }
 const err = (code) => Object.assign(new Error(code), { code });
 
-test('Python is explicitly required; asset path stays inside candidate', () => {
+test('Python is explicitly required; worker resolves to the package asset', () => {
   assert.throws(() => new HfcWorker(), /hfc-python-required/);
-  assert.match(defaultHfcWorkerPath().replaceAll('\\', '/'), /candidate\/assets\/hfc\/worker\.py$/);
+  assert.equal(defaultHfcWorkerPath(), fileURLToPath(new URL('../../../assets/hfc/worker.py', import.meta.url)));
 });
 
 test('short card uses one create and patches; finish is idempotent', async () => {

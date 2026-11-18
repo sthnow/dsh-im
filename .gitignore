@@ -12,3 +12,14 @@ e2e/
 # local verification helpers (personal paths, not part of the package)
 restart-host.sh
 restart-host.log
+
+# local release evidence and runtime state; never publish credentials or sessions
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.tmp
+__pycache__/
+*.py[cod]
+.feishu-flight-test-*/
