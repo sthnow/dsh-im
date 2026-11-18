@@ -172,7 +172,7 @@ test('disconnect uses the same committed-pending fence instead of pre-clearing s
   await assert.rejects(state.markSeen('deleted'), retired);
 });
 
-test('migrated legacy last-owner deletion remains compatible but does not revoke retained raw state', async t => {
+test('migrated legacy last-owner deletion revokes retained raw state', async t => {
   const f = await fixture(t, { legacy: true });
   const b = f.bots[0];
   assert.equal(b.secretRef, LEGACY_FEISHU_SECRET_REF);
@@ -180,10 +180,9 @@ test('migrated legacy last-owner deletion remains compatible but does not revoke
   await state.markSeen('legacy-before');
   await f.production.controller.deleteBot(b.id);
   await assert.rejects(readFile(f.pathFor(b)), { code: 'ENOENT' });
-  // Honest limitation: no per-bot legacy facade without changing the shared
-  // physical-store lock identity. This old reference can recreate the file.
-  await state.markSeen('legacy-old-reference-not-revoked');
-  assert.ok((await json(f.pathFor(b))).seenMessageIds.includes('legacy-old-reference-not-revoked'));
+  // The last owner's physical domain is retired, including legacy raw handles.
+  await assert.rejects(state.markSeen('legacy-old-reference-revoked'), retired);
+  await assert.rejects(readFile(f.pathFor(b)), { code: 'ENOENT' });
 });
 
 test('shared legacy physical path is retained with sessions and the other real bot remains active', async t => {

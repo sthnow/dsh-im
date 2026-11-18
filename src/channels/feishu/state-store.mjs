@@ -1,6 +1,5 @@
 import { deferredStateAccess, normalizeDeferredState } from '../shared/deferred-state.mjs';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { acquireCore, assertCoreReadable, assertCoreUsable, beginCoreRetirement, loadCore, releaseCore, retireCore, stateError, writeStateSnapshot } from './state-coordination.mjs';
 
 const EMPTY_STATE = Object.freeze({
   version: 1,
@@ -25,49 +24,76 @@ function validWatchEntry(value) {
 }
 
 export class StateStore {
-  #path;
-  #state = structuredClone(EMPTY_STATE);
-  #writeQueue = Promise.resolve();
+  #core;
+  #closed = false;
+  #closePromise;
   #deferred = deferredStateAccess(() => this.#state, () => this.#persist());
 
-  constructor(path) {
-    this.#path = path;
+  constructor(path) { this.#core = acquireCore(path, EMPTY_STATE); }
+
+  get #state() {
+    this.#assertOpen();
+    assertCoreReadable(this.#core);
+    return this.#core.state;
+  }
+
+  #assertOpen() {
+    if (this.#closed) throw stateError('FEISHU_STATE_CLOSED', 'Feishu state handle is closed');
+  }
+
+  #authorize() {
+    this.#assertOpen();
+    assertCoreUsable(this.#core);
   }
 
   async load() {
-    try {
-      const parsed = JSON.parse(await readFile(this.#path, 'utf8'));
-      this.#state = {
+    this.#assertOpen();
+    if (!this.#core.loading) {
+      this.#core.loading = Promise.resolve().then(() => loadCore(this.#core, (parsed) => ({
         version: 1,
         sessions: parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {},
         seenMessageIds: Array.isArray(parsed.seenMessageIds) ? parsed.seenMessageIds.slice(-1000) : [],
         watches: parsed.watches && typeof parsed.watches === 'object' ? parsed.watches : {},
         deferred: normalizeDeferredState(parsed.deferred),
-        includeArchivedSessions: typeof parsed.includeArchivedSessions === 'boolean'
-          ? parsed.includeArchivedSessions
-          : false,
+        includeArchivedSessions: parsed.includeArchivedSessions === true,
         topics: parsed.topics && typeof parsed.topics === 'object' ? parsed.topics : {},
         mirrors: parsed.mirrors && typeof parsed.mirrors === 'object' ? parsed.mirrors : {},
-      };
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-      await this.#persist();
+      }))).finally(() => { this.#core.loading = null; });
     }
+    await this.#core.loading;
+    this.#assertOpen();
+    assertCoreUsable(this.#core);
     return this;
   }
 
+  beginRetirement() { this.#assertOpen(); return beginCoreRetirement(this.#core); }
+  retire() { this.#assertOpen(); return retireCore(this.#core); }
+  static async retirePath(path) {
+    const core = acquireCore(path, EMPTY_STATE);
+    try { await retireCore(core); } finally { await releaseCore(core); }
+  }
+  close() {
+    if (!this.#closePromise) {
+      this.#closed = true;
+      this.#closePromise = releaseCore(this.#core);
+    }
+    return this.#closePromise;
+  }
+
   deferredEntries() { return this.#deferred.entries(); }
-  putDeferred(entry) { return this.#deferred.put(entry); }
-  patchDeferred(id, patch) { return this.#deferred.patch(id, patch); }
-  removeDeferred(id) { return this.#deferred.remove(id); }
+  async putDeferred(entry) { this.#authorize(); return this.#deferred.put(entry); }
+  async patchDeferred(id, patch) { this.#authorize(); return this.#deferred.patch(id, patch); }
+  async removeDeferred(id) { this.#authorize(); return this.#deferred.remove(id); }
 
   // ── Mirrors (persisted: open session-sync cards, recovered at startup) ──
   setMirror(sessionId, entry) {
+    this.#authorize();
     this.#state.mirrors[sessionId] = entry;
     return this.#persist();
   }
 
   clearMirror(sessionId) {
+    this.#authorize();
     delete this.#state.mirrors[sessionId];
     return this.#persist();
   }
@@ -78,6 +104,7 @@ export class StateStore {
 
   /** Queue a fresh snapshot, including mutations whose earlier write failed. */
   flush() {
+    this.#authorize();
     return this.#persist();
   }
 
@@ -86,16 +113,19 @@ export class StateStore {
   }
 
   async setSession(key, sessionId) {
+    this.#authorize();
     this.#state.sessions[key] = sessionId;
     await this.#persist();
   }
 
   async clearSession(key) {
+    this.#authorize();
     delete this.#state.sessions[key];
     await this.#persist();
   }
 
   async clearSessions() {
+    this.#authorize();
     this.#state.sessions = {};
     await this.#persist();
   }
@@ -105,6 +135,7 @@ export class StateStore {
   }
 
   async markSeen(messageId) {
+    this.#authorize();
     if (this.hasSeen(messageId)) return;
     this.#state.seenMessageIds.push(messageId);
     if (this.#state.seenMessageIds.length > 1000) {
@@ -129,6 +160,7 @@ export class StateStore {
   }
 
   async setWatch(key, entry) {
+    this.#authorize();
     const list = this.#state.watches[key] ?? [];
     const index = list.findIndex((existing) => existing.sessionId === entry.sessionId);
     if (index === -1) {
@@ -142,12 +174,14 @@ export class StateStore {
   }
 
   async removeWatch(key, sessionId) {
+    this.#authorize();
     const list = this.#state.watches[key] ?? [];
     this.#state.watches[key] = list.filter((entry) => entry.sessionId !== sessionId);
     await this.#persist();
   }
 
   async clearWatches(key) {
+    this.#authorize();
     delete this.#state.watches[key];
     await this.#persist();
   }
@@ -183,6 +217,7 @@ export class StateStore {
   }
 
   async setTopic(threadId, root) {
+    this.#authorize();
     const validRoot = root && typeof root === 'object'
       && typeof root.rootMessageId === 'string' && root.rootMessageId.length > 0
       && typeof root.chatId === 'string' && root.chatId.length > 0;
@@ -201,19 +236,18 @@ export class StateStore {
   }
 
   async setIncludeArchivedSessions(include) {
+    this.#authorize();
     this.#state.includeArchivedSessions = include === true;
     await this.#persist();
   }
 
-  async #persist() {
-    const snapshot = JSON.stringify(this.#state, null, 2) + '\n';
-    const operation = this.#writeQueue.then(async () => {
-      await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
-      const temporary = `${this.#path}.tmp`;
-      await writeFile(temporary, snapshot, { encoding: 'utf8', mode: 0o600 });
-      await rename(temporary, this.#path);
-    });
-    this.#writeQueue = operation.then(() => undefined, () => undefined);
-    await operation;
+  #persist() {
+    // Snapshot capture and mirror replacement both happen before the first await.
+    // Retirement drains these already-authorized snapshots, then commits its fence.
+    const core = this.#core;
+    const snapshot = JSON.stringify(core.state, null, 2) + '\n';
+    const operation = core.queue.then(() => writeStateSnapshot(core, snapshot));
+    core.queue = operation.then(() => undefined, () => undefined);
+    return operation;
   }
 }

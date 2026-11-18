@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rename, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { StateStore } from '../../../src/channels/feishu/state-store.mjs';
@@ -22,19 +24,19 @@ test('StateStore resumes writes after a rename failure and persists queued chang
   const dir = await mkdtemp(join(tmpdir(), 'dsh-feishu-state-recovery-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const path = join(dir, 'state.json');
-  const backup = join(dir, 'state.backup.json');
   const store = await new StateStore(path).load();
   await store.setSession('group:one', 'session-before');
 
-  // A directory at the destination makes rename fail on every supported OS.
-  await rename(path, backup);
-  await mkdir(path);
-  await assert.rejects(store.markSeen('message-failed'), (error) => error.syscall === 'rename');
-  assert.deepEqual(JSON.parse(await readFile(backup, 'utf8')).seenMessageIds, []);
-  assert.deepEqual(JSON.parse(await readFile(`${path}.tmp`, 'utf8')).seenMessageIds, ['message-failed']);
-
-  await rm(path, { recursive: true });
-  await rename(backup, path);
+  // Inject the I/O failure without replacing the guarded destination with an
+  // unsafe directory. Failed writes retain mutations but clean unique tmp files.
+  const renameSync = fs.renameSync;
+  fs.renameSync = () => { throw Object.assign(new Error('injected rename failure'), { syscall: 'rename' }); };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(store.markSeen('message-failed'), (error) => error.syscall === 'rename');
+    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')).seenMessageIds, []);
+    assert.equal(store.hasSeen('message-failed'), true);
+  } finally { fs.renameSync = renameSync; syncBuiltinESMExports(); }
   // Reuse the same instance: recovery must not depend on a bot restart.
   await Promise.all([
     store.markSeen('message-after'),
@@ -53,15 +55,15 @@ test('flush persists current state after a failed mirror deletion and later rebi
   const dir = await mkdtemp(join(tmpdir(), 'dsh-feishu-flush-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const path = join(dir, 'state.json');
-  const backup = join(dir, 'backup.json');
   const store = await new StateStore(path).load();
   await store.setMirror('key', { sessionId: 'old' });
-  await rename(path, backup);
-  await mkdir(path);
-  await assert.rejects(store.clearMirror('key'));
-  assert.equal(store.mirrorEntries().length, 0);
-  await rm(path, { recursive: true });
-  await rename(backup, path);
+  const renameSync = fs.renameSync;
+  fs.renameSync = () => { throw new Error('injected rename failure'); };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(store.clearMirror('key'));
+    assert.equal(store.mirrorEntries().length, 0);
+  } finally { fs.renameSync = renameSync; syncBuiltinESMExports(); }
   await store.flush();
   assert.deepEqual((await new StateStore(path).load()).mirrorEntries(), []);
   await store.setMirror('key', { sessionId: 'new' });

@@ -3,7 +3,7 @@ import { getImageInputSettingsStore } from '../../../../src/channels/shared/imag
 import { t } from '../../../../src/channels/shared/i18n.mjs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { unlink } from 'node:fs/promises';
+import { canonicalStatePath } from '../../../../src/channels/feishu/state-coordination.mjs';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import HttpsProxyAgent from 'https-proxy-agent';
 import { createConnectionSupervisor } from './connection-supervisor.mjs';
@@ -205,6 +205,7 @@ export async function createProductionController(ctx, config = {}, internals = {
           return result;
         };
         if (readers.has(property)) return (...args) => {
+          if (binding.retired) throw retiredError();
           const result = value.apply(target, args);
           if (property === 'mirrorEntries') return result.map(([key, entry]) => {
             if (!entry || typeof entry !== 'object') return [key, entry];
@@ -231,7 +232,8 @@ export async function createProductionController(ctx, config = {}, internals = {
     : resolve(paths.bots, botConfig.id, 'state.json');
   // Paths, rather than bot IDs, identify the file: legacy bots may share it.
   // Windows paths are case-insensitive in the supported default filesystem.
-  const stateKeyFor = (path) => process.platform === 'win32' ? path.toLowerCase() : path;
+  const stateKeyFor = (path) => canonicalStatePath(path);
+  const retirementHandles = new Map();
   const stateFor = (botConfig) => {
     const statePath = resolve(statePathFor(botConfig));
     const stateKey = stateKeyFor(statePath);
@@ -252,7 +254,11 @@ export async function createProductionController(ctx, config = {}, internals = {
     if (!loading) {
       // Register the promise before starting asynchronous I/O; all cold callers
       // then share both the load and the resulting store/write queue.
-      loading = Promise.resolve().then(() => new SessionStateStore(statePath).load());
+      loading = Promise.resolve().then(async () => {
+        const store = new SessionStateStore(statePath);
+        try { return await store.load(); }
+        catch (error) { await store.close?.(); throw error; }
+      });
       stateStores.set(stateKey, loading);
       loading.catch(() => {
         if (stateStores.get(stateKey) === loading) stateStores.delete(stateKey);
@@ -387,33 +393,34 @@ export async function createProductionController(ctx, config = {}, internals = {
       });
     },
     validateStateDeletion: ({ config: botConfig }) => validateStateDeletion(botConfig),
-    beginStateDeletion: ({ config: botConfig }) => {
-      // Legacy still exposes its physical store to preserve shared lock identity.
-      // Do not pretend that retiring a bot revokes those old raw references.
+    beginStateDeletion: async ({ config: botConfig }) => {
       if (isV2(botConfig)) retire(botConfig.id);
+      const stateKey = stateKeyFor(statePathFor(botConfig));
+      // A surviving legacy owner retains the entire shared physical domain.
+      if (!isV2(botConfig) && (!canListConfiguredBots || listConfiguredBots().some((other) =>
+        other.id !== botConfig.id && stateKeyFor(statePathFor(other)) === stateKey))) return;
+      // Acquire the physical core synchronously, even when this factory never
+      // loaded it: another factory/raw handle may already own the same path.
+      let fence = retirementHandles.get(stateKey);
+      if (!fence) {
+        fence = new StateStore(statePathFor(botConfig));
+        retirementHandles.set(stateKey, fence);
+      }
+      await fence.beginRetirement();
     },
     deleteState: async ({ config: botConfig }) => {
       const statePath = resolve(statePathFor(botConfig));
       const stateKey = stateKeyFor(statePath);
-      if (!isV2(botConfig)) {
-        // Unknown ownership or another legacy owner: retain the entire file,
-        // including sessions. The shared store cannot be partitioned per bot.
-        if (!canListConfiguredBots || listConfiguredBots().some((other) =>
-          other.id !== botConfig.id && stateKeyFor(resolve(statePathFor(other))) === stateKey)) return;
-      }
+      if (!isV2(botConfig) && (!canListConfiguredBots || listConfiguredBots().some((other) =>
+        other.id !== botConfig.id && stateKeyFor(statePathFor(other)) === stateKey))) return;
       const loading = stateStores.get(stateKey);
       const store = loading ? await loading.catch(() => null) : null;
       const binding = bindings.get(botConfig.id);
       if (binding) await Promise.allSettled([...binding.pending]);
-      // Drain the physical queue too (including writes begun before a facade
-      // tracked them). Legacy last-owner cleanup remains best effort: retained
-      // raw references are NOT revoked and may write again after this drain.
-      if (store) await store.flush();
-      try {
-        await unlink(statePath);
-      } catch (error) {
-        if (error?.code !== 'ENOENT') throw error;
-      }
+      const fence = retirementHandles.get(stateKey);
+      if (fence) await fence.retire();
+      else if (store?.retire) await store.retire();
+      else await StateStore.retirePath(statePath);
     },
   });
   const workspaceController = createWorkspaceAwareController(coreController, {
@@ -462,10 +469,20 @@ export async function createProductionController(ctx, config = {}, internals = {
     }),
     ready: supervisor.ready,
     async close() {
-      await supervisor.close();
-      await controller.close();
-      harness.stopManagedProcess();
-      wsAgent?.destroy?.();
+      try {
+        try { await supervisor.close(); }
+        finally { await controller.close(); }
+      } finally {
+        await Promise.allSettled([...stateStores.values()].map(async (loading) => {
+          const store = await loading.catch(() => null);
+          await store?.close?.();
+        }));
+        stateStores.clear();
+        await Promise.allSettled([...retirementHandles.values()].map((store) => store.close()));
+        retirementHandles.clear();
+        harness.stopManagedProcess();
+        wsAgent?.destroy?.();
+      }
     },
   };
 }
