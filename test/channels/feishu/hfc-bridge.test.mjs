@@ -75,7 +75,7 @@ function fixture(ask, options = {}) {
       ask: async (id, text, opts) => { calls.push({ kind: 'ask', id, text }); return ask(id, text, opts); } },
     state, status: {}, allowedSenderOpenIds: new Set(['user', 'other']),
     botId: 'bot-test', hfcRuntimeNamespace: options.hfcRuntimeNamespace === undefined ? '11111111-1111-4111-8111-111111111111' : options.hfcRuntimeNamespace,
-    stepPush: true, stepPushMode: 'hermes_card', hfcPresentation: options.presentation ?? { backend: 'hfc', testSessionIds: ['session-test'] },
+    stepPush: options.stepPush ?? true, stepPushMode: options.mode ?? 'hermes_card', hfcPresentation: options.presentation ?? { backend: 'hfc', testSessionIds: ['session-test'] },
     signal: options.signal, logger: { warn(tag, facts) { if (tag === '[dsh-feishu-hfc]') diagnosticLogs.push(JSON.parse(facts)); }, info() {}, error() {} },
     hfcDiagnostic: (stage, error, identity) => { diagnostics.push(hfcDiagnosticFacts(stage, error, identity)); return options.hfcDiagnostic?.(stage, error, identity); },
     hfcAdapterFactory: config => { const worker = new FakeWorker(options.worker); workers.push(worker); routes.push(config.route);
@@ -86,6 +86,52 @@ function fixture(ask, options = {}) {
     context: { open_message_id: writes.findLast(w => !w.card.schema)?.id ?? writes[0]?.id, open_chat_id: 'chat' }, action, ...extra });
   return { run, bridge, state, sessions, writes, posts, native, calls, adapters, workers, routes, callback, verifiedCalls, diagnostics, diagnosticLogs };
 }
+for (const chatType of ['p2p', 'group']) {
+  for (const binding of ['existing', 'unbound', 'recovered']) test(`hfc_card handles ${chatType} ${binding} session without whitelist`, async () => {
+    const unbound = binding === 'unbound';
+    const f = fixture(async (id, _text, options) => { await start(options); return `answer ${id}`; },
+      { mode: 'hfc_card', presentation: {backend:'legacy',testSessionIds:[]}, unbound, sessionExists: binding !== 'recovered' });
+    const event = incoming(); event.message.chat_type = chatType;
+    if (chatType === 'group' && !unbound) f.sessions.set('group:chat', 'group-existing');
+    await f.bridge.accept(event); await f.bridge.waitForIdle();
+    assert.equal(f.calls.filter(c => c.kind === 'ask').length, 1);
+    assert.equal(f.workers.length, 1);
+    assert.equal(f.routes[0].sessionId, binding !== 'existing' ? 'session-new' : chatType === 'p2p' ? 'session-test' : 'group-existing');
+    assert.equal(f.native.length, 0);
+  });
+}
+
+for (const mode of ['post','live_cot','streaming_card','hermes_card','off']) test(`explicit ${mode} supersedes residual HFC whitelist`, async () => {
+  const f = fixture(async (_id, _text, options) => { await options.onUpdate({type:'text',step:0,text:'legacy'}); return 'legacy'; });
+  if (mode === 'off') f.bridge.setStepPush(false); else f.bridge.setStepPushMode(mode,true);
+  await f.run(); assert.equal(f.workers.length,0);
+});
+
+test('hot switching freezes in-flight HFC owner and callback authority; next turn uses selected mode', async () => {
+  const ready=deferred(), finish=deferred(); let count=0, asks=0;
+  const f=fixture(async (_id,_text,options) => {
+    if (++asks > 1) { await options.onUpdate({type:'text',step:0,text:'legacy'}); return 'legacy'; }
+    await start(options); await options.onInteraction(question(async()=>{ count++; return {accepted:true}; }));
+    ready.resolve(); await finish.promise; return 'hfc complete';
+  }, {mode:'hfc_card',presentation:{backend:'hfc',testSessionIds:['session-test']}});
+  const running=f.run(); await ready.promise; const value=choice(f), owner=f.adapters[0];
+  f.bridge.setStepPushMode('hermes_card',true);
+  await f.callback({value},{operator:{open_id:'other'}}); assert.equal(count,0);
+  await f.callback({value}); assert.equal(count,1); assert.equal(f.adapters[0],owner);
+  finish.resolve(); await running;
+  assert.equal(f.workers[0].events.at(-1).event,'message.completed');
+  await f.run('next'); assert.equal(f.workers.length,1); assert.equal(asks,2);
+});
+
+test('all-session HFC never changes sender acceptance or identity fail-closed behavior', async () => {
+  const f=fixture(async()=>assert.fail('unauthorized ask'),{mode:'hfc_card',hfcRuntimeNamespace:null});
+  const event=incoming(); event.sender.sender_id.open_id='unauthorized';
+  await f.bridge.accept(event); await f.bridge.waitForIdle();
+  assert.equal(f.calls.filter(c=>c.kind==='ask').length,0);
+  await f.run('identity'); assert.equal(f.workers.length,0);
+  assert.equal(f.calls.filter(c=>c.kind==='ask').length,0);
+});
+
 // A progress update acknowledges state application, not its asynchronous PATCH receipt.
 // Hold the actual provider request so after-PATCH fault tests cannot silently test terminal-first publication.
 const patchGate = () => ({ entered: deferred(), release: deferred() });

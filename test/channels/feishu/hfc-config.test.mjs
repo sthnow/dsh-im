@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { normalizeHfcPresentation } from '../../../src/channels/feishu/hfc-presentation-config.mjs';
+import { assertHfcPresentationReady, normalizeHfcPresentation } from '../../../src/channels/feishu/hfc-presentation-config.mjs';
 import { PluginConfigStore } from '../../../src/channels/feishu/plugin-config-store.mjs';
 
 test('HFC trial is opt-in, bounded, and copies caller selection', () => {
@@ -30,4 +30,18 @@ test('old config loads without rewrite; trial setting survives per-bot persisten
   const reload=await new PluginConfigStore(path).load();
   assert.deepEqual(reload.getBot('one').hfcPresentation,{backend:'hfc',testSessionIds:['selected'],python:'C:/python.exe'});
   assert.equal(reload.getBot('two').hfcPresentation.backend,'legacy');
+  await store.saveBot({...store.getBot('one'),stepPush:true,stepPushMode:'hfc_card'});
+  const all=await new PluginConfigStore(path).load();
+  assert.equal(all.getBot('one').stepPushMode,'hfc_card');
+  assert.equal(all.getBot('one').stepPush,true);
+});
+
+test('HFC readiness requires explicit working Python, not PATH discovery', async () => {
+  await assert.rejects(assertHfcPresentationReady({}), {code:'hfc-python-required'});
+  await assert.rejects(assertHfcPresentationReady({python:'C:/nonexistent-private-python/python.exe'}), error => {
+    assert.equal(error.code,'hfc-python-unavailable');
+    assert.doesNotMatch(error.message,/nonexistent-private/);
+    return true;
+  });
+  if (process.env.DSH_HFC_TEST_PYTHON) await assertHfcPresentationReady({python:process.env.DSH_HFC_TEST_PYTHON});
 });

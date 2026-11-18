@@ -25,6 +25,7 @@ import {
   normalizeFeishuStepCardPanels,
 } from './step-push-mode.mjs';
 import { normalizeFeishuVoiceConfig } from './voice-config.mjs';
+import { assertHfcPresentationReady } from './hfc-presentation-config.mjs';
 import {
   isSlashPanelConfig,
   normalizeSlashPanelConfig,
@@ -820,22 +821,31 @@ export class MultiBotDshFeishuController {
     }
     return this.#serializeConfig(() => this.#withBotTransition(botId, async () => {
       const config = this.#requireBot(botId);
-      const saved = await this.#configStore.saveBot({ ...config, stepPush });
+      if (stepPush && config.stepPushMode === 'hfc_card') await assertHfcPresentationReady(config.hfcPresentation);
+      // An explicit off must also suppress the old whitelist override after restart.
+      const hfcPresentation = stepPush ? config.hfcPresentation : { ...config.hfcPresentation, backend: 'legacy' };
+      const saved = await this.#configStore.saveBot({ ...config, stepPush, hfcPresentation });
       this.#runtimes.get(botId)?.setStepPush?.(saved.stepPush);
       this.#touch();
       return this.status(botId);
     }));
   }
 
-  async updateStepPushMode(botId, stepPushMode) {
+  async updateStepPushMode(botId, stepPushMode, stepPush) {
     this.#assertOpen();
-    if (!isFeishuStepPushMode(stepPushMode)) {
+    if (!isFeishuStepPushMode(stepPushMode) || (stepPush !== undefined && typeof stepPush !== 'boolean')) {
       throw new TypeError('Invalid Feishu step push mode');
     }
     return this.#serializeConfig(() => this.#withBotTransition(botId, async () => {
       const config = this.#requireBot(botId);
-      const saved = await this.#configStore.saveBot({ ...config, stepPushMode });
-      this.#runtimes.get(botId)?.setStepPushMode?.(saved.stepPushMode);
+      // One durable write for the UI's flag+mode selection; old mode-only callers
+      // retain their flag. Probe before either persistence or runtime mutation.
+      const enabled = stepPush ?? config.stepPush === true;
+      if (enabled && stepPushMode === 'hfc_card') await assertHfcPresentationReady(config.hfcPresentation);
+      const saved = await this.#configStore.saveBot({ ...config, stepPushMode,
+        ...(stepPush === undefined ? {} : { stepPush }),
+        hfcPresentation: { ...config.hfcPresentation, backend: 'legacy' } });
+      this.#runtimes.get(botId)?.setStepPushMode?.(saved.stepPushMode, stepPush === undefined ? undefined : saved.stepPush);
       this.#touch();
       return this.status(botId);
     }));

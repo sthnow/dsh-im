@@ -521,9 +521,10 @@ function validPayload(endpoint, payload) {
       : '请选择是否分步直推。';
   }
   if (endpoint === FEISHU_ENDPOINTS.setStepPushMode) {
-    return hasOnlyKeys(payload, new Set(['botId', 'stepPushMode']))
+    return hasOnlyKeys(payload, new Set(['botId', 'stepPushMode', 'stepPush']))
       && safeOpaqueId(payload.botId)
       && isFeishuStepPushMode(payload.stepPushMode)
+      && (payload.stepPush === undefined || typeof payload.stepPush === 'boolean')
       ? null
       : '请选择分步直推的呈现方式。';
   }
@@ -872,7 +873,7 @@ export function createFeishuRpcHandler(controller, { encodeQr = qrCodeDataUrl } 
           throw new Error('Step push mode update is unavailable');
         }
         value = await toPublicFeishuStatus(
-          await controller.updateStepPushMode(payload.botId, payload.stepPushMode),
+          await controller.updateStepPushMode(payload.botId, payload.stepPushMode, payload.stepPush),
           { encodeQr: cachedEncodeQr },
         );
       } else if (endpoint === FEISHU_ENDPOINTS.setStepCardPanels) {
@@ -906,6 +907,15 @@ export function createFeishuRpcHandler(controller, { encodeQr = qrCodeDataUrl } 
       if (signal?.aborted) return cancelled();
       return { ok: true, value };
     } catch (error) {
+      const hfcMessages = {
+        'hfc-python-required': 'HFC requires an explicitly configured Python executable (hfcPresentation.python). Settings were not saved.',
+        'hfc-python-unavailable': 'HFC Python renderer is unavailable; verify hfcPresentation.python (Python 3.10+). Settings were not saved.',
+      };
+      if (Object.hasOwn(hfcMessages, error?.code)) {
+        return diagnosticRpcResult(diagnostics, error, { ok: false,
+          error: { code: error.code, message: hfcMessages[error.code], details: {} } },
+        { operation: endpoint, botId: payload?.botId });
+      }
       const workspaceError = publicWorkspaceError(error);
       return diagnosticRpcResult(diagnostics, error, signal?.aborted ? cancelled() : workspaceError
         ? { ok: false, error: { ...workspaceError, details: {} } }

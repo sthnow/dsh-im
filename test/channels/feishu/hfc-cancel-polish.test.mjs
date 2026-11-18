@@ -19,7 +19,7 @@ const find = (value, predicate) => {
 const incoming = (id, text) => ({ sender: { sender_type: 'user', sender_id: { open_id: 'user' } }, message: {
   message_id: id, message_type: 'text', chat_type: 'p2p', chat_id: 'chat', content: JSON.stringify({ text }),
 } });
-function fixture({ stop = async () => true, ask = async () => 'done', legacy = false, delivery = 'ok' } = {}) {
+function fixture({ stop = async () => true, ask = async () => 'done', legacy = false, delivery = 'ok', mode = 'hermes_card' } = {}) {
   const writes = [], reactions = [], removed = [], responses = [], adapters = [], native = [];
   const seen = new Set(); let sequence = 0, askCount = 0;
   const send = async request => {
@@ -44,7 +44,7 @@ function fixture({ stop = async () => true, ask = async () => 'done', legacy = f
       ask: async (_id, _text, options) => { askCount++; return ask(options, responses); } },
     state: { hasSeen: id => seen.has(id), markSeen: async id => seen.add(id), sessionFor: () => 'session-test' },
     status: {}, allowedSenderOpenIds: new Set(['user']), botId: 'bot-test',
-    hfcRuntimeNamespace: '11111111-1111-4111-8111-111111111111', stepPush: true, stepPushMode: 'hermes_card',
+    hfcRuntimeNamespace: '11111111-1111-4111-8111-111111111111', stepPush: true, stepPushMode: mode,
     hfcPresentation: { backend: legacy ? 'legacy' : 'hfc', testSessionIds: ['session-test'] },
     hfcAdapterFactory: config => { const adapter = new DshHfcAdapter({ ...config, worker: new HfcWorker({ python }), minPatchIntervalMs: 0, minRenderIntervalMs: 0 }); adapters.push(adapter); return adapter; },
     logger: { warn() {}, error() {}, info() {} },
@@ -55,6 +55,8 @@ function fixture({ stop = async () => true, ask = async () => 'done', legacy = f
 }
 for (const scenario of [
   { name: 'successful HFC stop clears processing only', expected: ['OnIt'] },
+  { name: 'all-session HFC stop uses HFC policy without legacy whitelist', mode: 'hfc_card', legacy: true, expected: ['OnIt'] },
+  { name: 'all-session HFC stop failure is closed', mode: 'hfc_card', legacy: true, stop: async () => { throw Error('stop failed'); }, expected: ['OnIt', 'ERROR'] },
   { name: 'normally returned no-task stop retains legacy command DONE', stop: async () => false, expected: ['OnIt', 'DONE'] },
   { name: 'stop exception is ERROR', stop: async () => { throw Error('stop failed'); }, expected: ['OnIt', 'ERROR'] },
   { name: 'stop acknowledgement send failure is ERROR', delivery: 'throw', expected: ['OnIt', 'ERROR'] },

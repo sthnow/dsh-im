@@ -31,7 +31,7 @@ test('hermes_card is opt-in while existing mode values, fallback, and new-bot de
   assert.equal(FEISHU_STEP_PUSH_MODES.HERMES_CARD, 'hermes_card');
   assert.equal(DEFAULT_FEISHU_STEP_PUSH_MODE, 'streaming_card');
   assert.ok(Object.isFrozen(FEISHU_STEP_PUSH_MODES));
-  for (const mode of ['post', 'live_cot', 'streaming_card', 'hermes_card']) {
+  for (const mode of ['post', 'live_cot', 'streaming_card', 'hermes_card', 'hfc_card']) {
     assert.equal(normalizeFeishuStepPushMode(mode), mode);
     assert.equal(isFeishuStepPushMode(mode), true);
     assert.equal(connection(mode).stepPushMode, mode, 'browser snapshot shares the host normalizer');
@@ -53,9 +53,9 @@ test('Hermes remains an additional single-select option and never migrates exist
   assert.equal(select().type, 'select');
   assert.equal(select().props.multiple, undefined);
   assert.deepEqual(select().findAllByType('option').map((node) => node.props.value), [
-    'off', 'live_cot', 'streaming_card', 'hermes_card', 'post',
+    'off', 'live_cot', 'streaming_card', 'hermes_card', 'hfc_card', 'post',
   ]);
-  for (const mode of ['post', 'live_cot', 'streaming_card', 'hermes_card']) {
+  for (const mode of ['post', 'live_cot', 'streaming_card', 'hermes_card', 'hfc_card']) {
     await act(async () => view.update(React.createElement(BotCard, {
       connection: connection(mode),
       onStepPushSave: (value) => writes.push(['flag', value]),
@@ -64,32 +64,49 @@ test('Hermes remains an additional single-select option and never migrates exist
     assert.equal(select().props.value, mode);
   }
   assert.deepEqual(writes, [], 'reading any bot must not save or migrate its configuration');
+  await act(async () => view.update(React.createElement(BotCard, { connection: connection('hermes_card') })));
   assert.match(text(view.root), /状态、正文与可折叠过程/);
   assert.match(text(view.root), /真实统计/);
   assert.match(text(view.root), /未提供的统计不显示/);
 });
 
-test('enabling Hermes saves the flag first, switching changes only mode, and disabling preserves mode', async (t) => {
+test('Hermes selection saves flag and mode atomically and disabling preserves mode', async (t) => {
   const writes = [];
   const handlers = {
     onStepPushSave: async (value) => { writes.push(['flag', value]); },
-    onStepPushModeSave: async (value) => { writes.push(['mode', value]); },
+    onStepPushModeSave: async (value, flag) => { writes.push(['mode', value, flag]); },
   };
   const view = await mountCard(t, connection('post', false), handlers);
   const select = () => view.root.findByProps({ 'aria-label': '任务过程展示' });
   assert.equal(select().props.value, 'off');
   await act(async () => select().props.onChange({ target: { value: 'hermes_card' } }));
-  assert.deepEqual(writes, [['flag', true], ['mode', 'hermes_card']]);
+  assert.deepEqual(writes, [['mode', 'hermes_card', true]]);
   await act(async () => view.update(React.createElement(BotCard, { connection: connection('streaming_card'), ...handlers })));
   writes.length = 0;
   await act(async () => select().props.onChange({ target: { value: 'hermes_card' } }));
-  assert.deepEqual(writes, [['mode', 'hermes_card']]);
+  assert.deepEqual(writes, [['mode', 'hermes_card', true]]);
   await act(async () => view.update(React.createElement(BotCard, { connection: connection('hermes_card'), ...handlers })));
   writes.length = 0;
   await act(async () => select().props.onChange({ target: { value: 'hermes_card' } }));
   assert.deepEqual(writes, []);
   await act(async () => select().props.onChange({ target: { value: 'off' } }));
-  assert.deepEqual(writes, [['flag', false]]);
+  assert.deepEqual(writes, [['mode', 'hermes_card', false]]);
+});
+
+test('HFC independent selection uses one save; rejected enable never changes flag or mode', async t => {
+  const writes=[];
+  const view=await mountCard(t,connection('hermes_card',false),{
+    onStepPushSave:async value=>writes.push(['flag',value]),
+    onStepPushModeSave:async (mode,flag)=>{ writes.push([mode,flag]); throw Error('HFC Python renderer is unavailable'); },
+  });
+  const select=()=>view.root.findByProps({'aria-label':'任务过程展示'});
+  await act(async()=>select().props.onChange({target:{value:'hfc_card'}}));
+  assert.deepEqual(writes,[['hfc_card',true]]); assert.equal(select().props.value,'off');
+  assert.match(text(view.root.findByProps({role:'alert'})),/Python/);
+  await act(async()=>view.update(React.createElement(BotCard,{connection:connection('hfc_card'),onStepPushModeSave:async(mode,flag)=>writes.push([mode,flag])})));
+  assert.equal(select().props.value,'hfc_card');
+  await act(async()=>select().props.onChange({target:{value:'off'}}));
+  assert.deepEqual(writes.at(-1),['hfc_card',false]);
 });
 
 test('Hermes save failures show feedback without changing the rendered mode', async (t) => {
@@ -140,7 +157,7 @@ test('all Hermes settings copy has explicit English and Russian mappings and Eng
   const keys = [
     'Hermes 风格卡片（状态、正文、过程与统计）',
     'Hermes 风格：状态、正文与可折叠过程在同一卡片中更新，结束后展示可用的真实统计；未提供的统计不显示',
-    '设置任务执行过程的呈现方式：不显示、原生直播、实时卡片、Hermes 风格卡片或逐步消息',
+    '设置任务执行过程的呈现方式：不显示、原生直播、实时卡片、Hermes 风格卡片、HFC 卡片或逐步消息',
     '实时过程卡分别控制思考与工具面板，任务结束后自动收起；Hermes 风格卡片共用一个过程面板，任一开关开启即展开，任务结束后保持该设置。',
   ];
   for (const key of keys) {

@@ -1128,10 +1128,13 @@ export class FeishuHarnessBridge {
 
   setStepPush(value) {
     this.#stepPush = value === true;
+    if (!this.#stepPush) this.#hfcPresentation = Object.freeze({ ...this.#hfcPresentation, backend: 'legacy' });
   }
 
-  setStepPushMode(value) {
+  setStepPushMode(value, stepPush) {
     this.#stepPushMode = normalizeFeishuStepPushMode(value);
+    if (typeof stepPush === 'boolean') this.#stepPush = stepPush;
+    this.#hfcPresentation = Object.freeze({ ...this.#hfcPresentation, backend: 'legacy' });
   }
 
   setStepCardPanels(value) {
@@ -1910,7 +1913,7 @@ export class FeishuHarnessBridge {
     // Snapshot the actual selected session before stop can settle/remove its owner.
     // A normally returned command is not evidence that a task was stopped.
     const hfcStop = runner === runControlCommand && /^\/stop$/iu.test(message.content?.trim() ?? '')
-      && this.#hfcSelected(key);
+      && (this.#hfcOwners.has(key) || this.#hfcSelected(key));
     let result = await runner(
       nonEmptyString(message.content) ?? '',
       this.#harness,
@@ -6598,6 +6601,7 @@ export class FeishuHarnessBridge {
   }
 
   #hfcSelected(key) {
+    if (this.#stepPushMode === FEISHU_STEP_PUSH_MODES.HFC_CARD) return this.#stepPush;
     const sessionId = this.#state.sessionFor(key);
     return this.#hfcPresentation.backend === 'hfc'
       && typeof sessionId === 'string'
@@ -6608,6 +6612,9 @@ export class FeishuHarnessBridge {
     const chatId = event.message.chat_id;
     const inboundId = event.message.message_id;
     const selectedSessionId = this.#state.sessionFor(key);
+    // Freeze presentation eligibility for this turn. UI changes affect the next
+    // turn, never transfer the current renderer or interaction authority.
+    const allSessions = this.#stepPush && this.#stepPushMode === FEISHU_STEP_PUSH_MODES.HFC_CARD;
     if (!this.#hfcRuntimeNamespace || !this.#botId || !senderOpenId(event)) {
       this.#endImTurn(key);
       const error = hfcIdentityError(!this.#hfcRuntimeNamespace);
@@ -6763,8 +6770,9 @@ export class FeishuHarnessBridge {
         createOptions: { signal }, existsOptions: { signal },
         prepareContent: async (context) => {
           live();
-          if (context.sessionId !== selectedSessionId
-            || !this.#hfcPresentation.testSessionIds.includes(context.sessionId)) {
+          if (typeof context.sessionId !== 'string' || !context.sessionId
+            || this.#state.sessionFor(key) !== context.sessionId
+            || (!allSessions && context.sessionId !== selectedSessionId)) {
             throw new Error('HFC session binding changed before ask; no fallback submitted');
           }
           owner.sessionId = context.sessionId;

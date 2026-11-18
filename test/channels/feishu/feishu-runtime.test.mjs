@@ -102,6 +102,20 @@ function fakeLark() {
   };
 }
 
+test('FeishuRuntime forwards atomic HFC mode/flag hot changes through its actual bridge', async t => {
+  const original=FeishuHarnessBridge.prototype.setStepPushMode, updates=[];
+  FeishuHarnessBridge.prototype.setStepPushMode=function(...args) { updates.push(args); original.apply(this,args); assert.equal(this.stepPushMode,args[0]); };
+  t.after(()=>{FeishuHarnessBridge.prototype.setStepPushMode=original;});
+  const runtime=new FeishuRuntime({lark:fakeLark(),appId:'cli_test',appSecret:'secret',ownerOpenIds:['user'],slashCommands:false,
+    harness:{ensureRunning:async()=>{}},state:{hasSeen:()=>false},
+    hfcPresentation:{backend:'hfc',testSessionIds:['s'],python:'explicit'}});
+  const starting=runtime.start(); await waitFor(()=>FakeWSClient.instances.length===1); FakeWSClient.instances[0].becomeReady(); await starting;
+  t.after(()=>runtime.stop());
+  runtime.setStepPushMode('hfc_card',true); runtime.setStepPushMode('hermes_card',false);
+  assert.deepEqual(updates,[['hfc_card',true],['hermes_card',false]]);
+  assert.equal(FakeWSClient.instances.length,1);
+});
+
 function deferred() {
   let resolve;
   let reject;

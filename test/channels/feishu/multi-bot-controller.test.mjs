@@ -11,6 +11,49 @@ import { normalizeBotsSnapshot } from '../../../plugin-src/client/channels/feish
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
+for (const python of [undefined,'C:/private-missing-python/python.exe']) test(`HFC RPC rejects ${python ? 'unavailable' : 'missing'} Python before mutation`, async t => {
+  const existing={...bot('hfc-reject'),stepPush:false,stepPushMode:'hermes_card',hfcPresentation:{backend:'hfc',testSessionIds:['s'],python}};
+  const fx=fixture({bots:[existing],secrets:{[existing.secretRef]:'secret'}}); t.after(()=>fx.controller.close());
+  await fx.controller.initialize(); const before=fx.configStore.getBot(existing.id);
+  const updates=[]; fx.runtimes.get(existing.id)[0].setStepPushMode=(...args)=>updates.push(args);
+  const result=await createFeishuRpcHandler(fx.controller)(FEISHU_ENDPOINTS.setStepPushMode,{botId:existing.id,stepPushMode:'hfc_card',stepPush:true});
+  assert.equal(result.ok,false); assert.equal(result.error.code,python?'hfc-python-unavailable':'hfc-python-required');
+  assert.match(result.error.message,/Python/); assert.doesNotMatch(JSON.stringify(result),/private-missing/);
+  assert.deepEqual(fx.configStore.getBot(existing.id),before); assert.deepEqual(updates,[]);
+});
+
+test('HFC RPC persists atomic flag/mode, preserves Python, hides private config and hot switches without reconnect', {skip:!process.env.DSH_HFC_TEST_PYTHON}, async t => {
+  const existing={...bot('hfc-live'),stepPush:false,stepPushMode:'post',hfcPresentation:{backend:'hfc',testSessionIds:['s'],python:process.env.DSH_HFC_TEST_PYTHON}};
+  const fx=fixture({bots:[existing],secrets:{[existing.secretRef]:'secret'}}); t.after(()=>fx.controller.close());
+  await fx.controller.initialize(); const runtime=fx.runtimes.get(existing.id)[0], updates=[];
+  runtime.setStepPushMode=(...args)=>updates.push(args);
+  const save=fx.configStore.saveBot.bind(fx.configStore); let writes=0;
+  fx.configStore.saveBot=async value=>{writes++;return save(value);};
+  const rpc=createFeishuRpcHandler(fx.controller);
+  const result=await rpc(FEISHU_ENDPOINTS.setStepPushMode,{botId:existing.id,stepPushMode:'hfc_card',stepPush:true});
+  assert.equal(result.ok,true); assert.equal(writes,1);
+  assert.equal(normalizeBotsSnapshot(result.value).bots[0].stepPushMode,'hfc_card');
+  assert.equal(result.value.bots[0].stepPush,true); assert.equal('hfcPresentation' in result.value.bots[0],false);
+  assert.deepEqual(updates,[['hfc_card',true]]);
+  assert.deepEqual(fx.configStore.getBot(existing.id).hfcPresentation,{...existing.hfcPresentation,backend:'legacy'});
+  await rpc(FEISHU_ENDPOINTS.setStepPushMode,{botId:existing.id,stepPushMode:'hermes_card'});
+  assert.equal(fx.configStore.getBot(existing.id).stepPush,true,'legacy mode-only RPC retains flag');
+  await rpc(FEISHU_ENDPOINTS.setStepPushMode,{botId:existing.id,stepPushMode:'hermes_card',stepPush:false});
+  assert.equal(fx.configStore.getBot(existing.id).stepPush,false);
+  assert.equal(fx.runtimes.get(existing.id).length,1); assert.equal(runtime.stops,0);
+  for(const stepPush of [null,'true',0]) assert.equal((await rpc(FEISHU_ENDPOINTS.setStepPushMode,{botId:existing.id,stepPushMode:'hfc_card',stepPush})).error.code,'bad-request');
+  const before=fx.configStore.getBot(existing.id); fx.configStore.saveBot=async()=>{throw Error('disk full');}; const count=updates.length;
+  await assert.rejects(fx.controller.updateStepPushMode(existing.id,'hfc_card',true),/disk full/);
+  assert.deepEqual(fx.configStore.getBot(existing.id),before); assert.equal(updates.length,count);
+});
+
+test('old flag-only off persists suppression of HFC whitelist without dropping explicit Python', async t => {
+  const existing={...bot('hfc-off'),stepPush:true,hfcPresentation:{backend:'hfc',testSessionIds:['s'],python:'explicit'}};
+  const fx=fixture({bots:[existing],secrets:{[existing.secretRef]:'secret'}}); t.after(()=>fx.controller.close());
+  await fx.controller.initialize(); await fx.controller.updateStepPush(existing.id,false);
+  assert.deepEqual(fx.configStore.getBot(existing.id).hfcPresentation,{...existing.hfcPresentation,backend:'legacy'});
+});
+
 test('panel management RPC preserves legacy defaults, validates input, and updates only the saved bot without reconnecting', async (t) => {
   const existing = bot('bot_panels', 'panels');
   const other = bot('bot_other', 'other');

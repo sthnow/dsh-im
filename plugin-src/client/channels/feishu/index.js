@@ -499,22 +499,18 @@ function StepPushEditor({ value = false, mode = "post", disabled = false, onSave
     const next = event.target.value;
     if (next === current) return;
     void save(async () => {
-      if (next === "off") {
-        // Turning off only needs the flag when it was on.
-        if (value === true) await onSave?.(false);
-        return;
-      }
-      const nextMode = ["streaming_card", "live_cot", "hermes_card"].includes(next) ? next : "post";
-      // Enabling (or switching presentation) may need both writes; the flag
-      // must land before the mode so the runtime never sees a mode without
-      // step push enabled.
-      if (value !== true) await onSave?.(true);
-      if (nextMode !== mode) await onModeSave?.(nextMode);
+      const nextMode = next === "off" ? mode
+        : ["streaming_card", "live_cot", "hermes_card", "hfc_card"].includes(next) ? next : "post";
+      // Flag + mode are one RPC/save: a Python/readiness or disk failure must
+      // not leave the UI half-enabled or briefly revive a legacy whitelist.
+      await onModeSave?.(nextMode, next !== "off");
     });
   };
 
   const helpText = current === "off"
     ? "适合日常问答：执行过程中不显示工具调用等中间步骤，只回复最终结果"
+    : current === "hfc_card"
+      ? "HFC 卡片：此机器人的所有私聊和群聊（含新会话）使用固定版 Python 渲染；需要预先配置 Python，不改变执行权限"
     : current === "hermes_card"
       ? "Hermes 风格：状态、正文与可折叠过程在同一卡片中更新，结束后展示可用的真实统计；未提供的统计不显示"
     : current === "live_cot"
@@ -541,7 +537,7 @@ function StepPushEditor({ value = false, mode = "post", disabled = false, onSave
           id: helpId,
           className: "dim-presetTooltip",
           role: "tooltip",
-        }, "设置任务执行过程的呈现方式：不显示、原生直播、实时卡片、Hermes 风格卡片或逐步消息"))),
+        }, "设置任务执行过程的呈现方式：不显示、原生直播、实时卡片、Hermes 风格卡片、HFC 卡片或逐步消息"))),
     saving
       ? h("span", { className: "dim-feishuGroupControlStatus", role: "status" }, "保存中…")
       : null),
@@ -556,6 +552,7 @@ function StepPushEditor({ value = false, mode = "post", disabled = false, onSave
   h("option", { value: "live_cot" }, "实时直播（飞书原生思考过程）"),
   h("option", { value: "streaming_card" }, "实时过程卡（全程一张卡片动态更新）"),
   h("option", { value: "hermes_card" }, "Hermes 风格卡片（状态、正文、过程与统计）"),
+  h("option", { value: "hfc_card" }, "HFC 卡片（所有私聊和群聊）"),
   h("option", { value: "post" }, "逐步直播（每一步单独发一条消息）")),
   h("p", { className: "dim-feishuGroupHelp" }, helpText),
   error ? h("p", {
@@ -773,7 +770,7 @@ function BotList(props) {
           onAgentPresetSave: (agentPreset) => props.onAgentPresetSave(bot, agentPreset),
           onContextEnhancementSave: (config) => props.onContextEnhancementSave(bot, config),
           onStepPushSave: (stepPush) => props.onStepPushSave(bot, stepPush),
-          onStepPushModeSave: (stepPushMode) => props.onStepPushModeSave(bot, stepPushMode),
+          onStepPushModeSave: (stepPushMode, stepPush) => props.onStepPushModeSave(bot, stepPushMode, stepPush),
           onRequestRemove: () => props.onRequestRemove(bot),
           onConfirmRemove: () => props.onConfirmRemove(bot),
           onCancelRemove: props.onCancelRemove,
@@ -1580,8 +1577,8 @@ export function FeishuSettingsTab({ rpcCall }) {
                   onStepPushSave: (connection, stepPush) => saveBotSetting(
                     connection, "step-push", FEISHU_ENDPOINTS.setStepPush, { stepPush },
                   ),
-                  onStepPushModeSave: (connection, stepPushMode) => saveBotSetting(
-                    connection, "step-push-mode", FEISHU_ENDPOINTS.setStepPushMode, { stepPushMode },
+                  onStepPushModeSave: (connection, stepPushMode, stepPush) => saveBotSetting(
+                    connection, "step-push-mode", FEISHU_ENDPOINTS.setStepPushMode, { stepPushMode, stepPush },
                   ),
                   onRequestRemove: requestRemove,
                   onConfirmRemove: (bot) => void confirmRemove(bot),

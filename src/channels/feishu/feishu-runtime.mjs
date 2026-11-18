@@ -272,12 +272,15 @@ export class FeishuRuntime {
 
   setStepPush(value) {
     this.#stepPush = value === true;
+    if (!this.#stepPush) this.#hfcPresentation = normalizeHfcPresentation({ ...this.#hfcPresentation, backend: 'legacy' });
     this.#bridge?.setStepPush(this.#stepPush);
   }
 
-  setStepPushMode(value) {
+  setStepPushMode(value, stepPush) {
     this.#stepPushMode = normalizeFeishuStepPushMode(value);
-    this.#bridge?.setStepPushMode(this.#stepPushMode);
+    if (typeof stepPush === 'boolean') this.#stepPush = stepPush;
+    this.#hfcPresentation = normalizeHfcPresentation({ ...this.#hfcPresentation, backend: 'legacy' });
+    this.#bridge?.setStepPushMode(this.#stepPushMode, stepPush);
   }
 
   setStepCardPanels(value) {
